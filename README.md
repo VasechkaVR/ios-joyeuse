@@ -25,7 +25,7 @@ gh workflow run xnu.yaml
 gh run download RUN_ID -n joyeuse-xnu -D xnu/out
 ```
 
-Hardware ADTs need the stock boot image, the unwrapped iPhone X `d22ap.adt`, the phone's FT8756 firmware and its Wi-Fi and Bluetooth addresses (six raw bytes each), all in `fw/`. Keep these inputs and the generated ADT and payload private.
+Hardware ADTs need the stock boot image, the iPhone X `d22ap.adt` device tree (IM4P or unwrapped), the phone's FT8756 firmware and its Wi-Fi and Bluetooth addresses (six raw bytes each), all in `fw/`. Keep these inputs and the generated ADT and payload private.
 
 ```sh
 mkdir -p out
@@ -46,7 +46,7 @@ tools/mkiosroot-macos.sh ipsw/OS.dmg ipsw/SystemOS.dmg ipsw/AppOS.dmg out/ios16-
 
 `root-resume.sh` finishes an interrupted image in place, `root-variant.sh` makes copy-on-write variants of `out/ios16-root.img`, and `sparsediff.py OLD NEW OUT.simg` writes only the changed blocks for reflashing.
 
-For offline diagnostics, `mkadt.py --qemu` builds a virtual tree and `qemu-sweet.py --disk IMAGE --kernel KERNEL` boots it with a separate `disk.qcow2` overlay; `rd=rvblk0 virtio_blk=1` selects a read-only HFS root and `virtio_blk=2` permits overlay writes.
+For offline diagnostics, `mkadt.py --qemu` builds a virtual tree and `qemu-sweet.py PAYLOAD OUTDIR --disk IMAGE --kernel KERNEL` boots it with a separate `disk.qcow2` overlay; `rd=rvblk0 virtio_blk=1` selects a read-only HFS root and `virtio_blk=2` permits overlay writes.
 
 ## Device Workflow
 
