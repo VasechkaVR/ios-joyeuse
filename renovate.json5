@@ -4,6 +4,11 @@
   forkProcessing: "enabled",
   packageRules: [
     {
+      description: "PR checks never apply the patch stack on this pin; build a bump with workflow_dispatch before merging",
+      matchDepNames: ["https://github.com/blacktop/darwin-xnu-build"],
+      automerge: false,
+    },
+    {
       description: "Keep the Apple providers paired with the macOS 13.5 XNU ABI",
       matchDepNames: [
         "https://github.com/apple-oss-distributions/hfs",
