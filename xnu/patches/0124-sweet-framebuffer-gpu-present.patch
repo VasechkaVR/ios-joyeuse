@@ -127,7 +127,7 @@ index b6c1a41..7d0d41b 100644
  		}
  		printf("SWEET USB: configured (%u)\n", value);
  	} else if (req == 8) {          /* GET_CONFIGURATION */
-@@ -456,9 +508,17 @@ ud_setup(void)
+@@ -456,8 +508,16 @@ ud_setup(void)
  		data[0] = 0; data[1] = 0; n = 2;
  	} else if (req == 11) {         /* SET_INTERFACE */
  		if (index == 1) {
@@ -147,8 +147,7 @@ index b6c1a41..7d0d41b 100644
 +				}
 +				lck_mtx_unlock(ud.lock);
 +			}
- 		}
- 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		} else if (req == 10) {         /* GET_INTERFACE */
 @@ -523,7 +583,9 @@ ud_rx_done(void)
  			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
  			stats.packets_in = 1;
