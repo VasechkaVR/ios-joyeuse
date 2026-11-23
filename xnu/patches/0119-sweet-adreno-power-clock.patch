@@ -621,7 +621,7 @@ index 0000000..27d080f
 +{
 + if (!result) return EINVAL;
 + *result = (struct a618_pas_result){0};
-+ if (!reserved || physical != 0x97f15000ull || !metadata || !metadata->cpu ||
++ if (!reserved || physical != 0x93b15000ull || !metadata || !metadata->cpu ||
 +     metadata->bytes != 0x4000 || !metadata->uncached ||
 +     !metadata->physical || (metadata->physical & 0x3fff) ||
 +     metadata->physical >= (1ull << 36) || !mdt || !code ||
@@ -1212,7 +1212,7 @@ index 0000000..638a4d5
 + const uint32_t *reserved_size = NULL;
 + unsigned length = 0;
 + if (!error && (SecureDTGetProperty(node, "zap-reserved-base", (const void **)&reserved_base,
-+     &length) != kSuccess || length != 8 || *reserved_base != 0x97f15000ull)) error = EINVAL;
++     &length) != kSuccess || length != 8 || *reserved_base != 0x93b15000ull)) error = EINVAL;
 + if (!error && (SecureDTGetProperty(node, "zap-reserved-size", (const void **)&reserved_size,
 +     &length) != kSuccess || length != 4 || *reserved_size != 0x2000)) error = EINVAL;
 + printf("SWEET ADRENO: CP firmware properties errno=%d SQE=%u MDT=%u ZAP=%u\n",

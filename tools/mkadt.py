@@ -18,6 +18,17 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt
+try:
+    from sweet_adreno_firmware import firmware_properties
+except ModuleNotFoundError:
+    from importlib.util import spec_from_file_location, module_from_spec
+
+    _spec = spec_from_file_location(
+        "sweet_adreno_firmware", Path(__file__).with_name("sweet-adreno-firmware.py")
+    )
+    _firmware = module_from_spec(_spec)
+    _spec.loader.exec_module(_firmware)
+    firmware_properties = _firmware.firmware_properties
 
 # Kernel-managed RAM (non-highmem, qemu/testing): above every Qualcomm XPU
 # carve-out. Hardware builds use the upper bank with --highmem.
@@ -95,6 +106,7 @@ def build(
     mem=None,
     product=None,
     touch_firmware=None,
+    adreno_firmware_dir="fw",
     wifi_mac=None,
     bluetooth_mac=None,
 ):
@@ -109,6 +121,10 @@ def build(
         raise ValueError(
             "--touch-firmware PATH is required for joyeuse hardware builds"
         )
+    if not qemu:
+        adreno_props = firmware_properties(adreno_firmware_dir)
+    else:
+        adreno_props = []
     if highmem:
         phys_base, mem_size = HIGH_PHYS, HIGH_MEM
     else:
@@ -305,8 +321,12 @@ def build(
     )
 
     if not qemu:
-        chosen.props.append(
-            ("focaltech-firmware", 0, Path(touch_firmware).read_bytes())
+        chosen.props.extend(
+            [
+                ("focaltech-firmware", 0, Path(touch_firmware).read_bytes()),
+                ("zap-reserved-base", 0, u64(0x93B15000)),
+                *adreno_props,
+            ]
         )
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -360,6 +380,7 @@ if __name__ == "__main__":
         "--product",
         help="D22AP ADT or prior generated ADT containing /product (required for hardware)",
     )
+    ap.add_argument("--adreno-firmware-dir", default="fw")
     ap.add_argument(
         "--touch-firmware",
         help="device-supplied FT8756 firmware (required for joyeuse hardware)",
@@ -386,6 +407,7 @@ if __name__ == "__main__":
         mem=args.mem,
         product=args.product,
         touch_firmware=args.touch_firmware,
+        adreno_firmware_dir=args.adreno_firmware_dir,
         wifi_mac=args.wifi_mac,
         bluetooth_mac=args.bluetooth_mac,
     )
