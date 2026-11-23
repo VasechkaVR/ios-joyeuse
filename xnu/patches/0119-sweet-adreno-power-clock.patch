@@ -1,0 +1,2736 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+new file mode 100644
+index 0000000..58a1e02
+--- /dev/null
++++ b/bsd/dev/sweet_adreno.c
+@@ -0,0 +1,199 @@
++/* SPDX-License-Identifier: MIT
++ * Copyright (c) 2026 ios-sweet contributors
++ *
++ * Original portable implementation of the public A6xx PM4 wire format and
++ * SDM7150 CX GDSC sequence. References and limitations: docs/adreno-port.md.
++ * No Linux DRM or Mesa rendering implementation is included in this file.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno.h"
++
++#define CX_GDSCR 0x106cu
++#define CX_STATUS 0x1540u
++#define COLLAPSE 1u
++#define HW_CONTROL 2u
++#define POWER_ON 0x80000000u
++
++int
++a618_enable_cx(const struct a618_io *io, struct a618_power_result *result)
++{
++	uint32_t control, status;
++	if (!io || !result || !io->read || !io->write || !io->delay_us)
++		return EINVAL;
++	result->waited_us = 0;
++	control = result->control = io->read(io->cookie, CX_GDSCR);
++	status = result->status = io->read(io->cookie, CX_STATUS);
++	if (control == 0xffffffffu || status == 0xffffffffu)
++		return EIO;
++	if (control & HW_CONTROL)
++		return EBUSY;
++	/* This call does not reset an already powered domain. */
++	if (!(control & COLLAPSE) && (status & POWER_ON))
++		return 0;
++	/* Live DT: qcom,clk-dis-wait-val = 8; preserve all other fields. */
++	control = (control & ~(0xfu << 12)) | (8u << 12);
++	io->write(io->cookie, CX_GDSCR, control & ~COLLAPSE);
++	/* Qualcomm gdsc_enable: allow at least eight XO cycles before polling. */
++	io->delay_us(io->cookie, 1);
++	for (unsigned elapsed = 0; elapsed < 500; ++elapsed) {
++		result->waited_us = elapsed + 1;
++		status = result->status = io->read(io->cookie, CX_STATUS);
++		if (status == 0xffffffffu)
++			return EIO;
++		if (status & POWER_ON) {
++			/* Clock re-enable/memory power-up settling from gdsc_enable. */
++			io->delay_us(io->cookie, 2);
++			result->control = io->read(io->cookie, CX_GDSCR);
++			if (result->control == 0xffffffffu ||
++			    (result->control & (COLLAPSE | HW_CONTROL)))
++				return EIO;
++			return 0;
++		}
++		io->delay_us(io->cookie, 1);
++	}
++	result->control = io->read(io->cookie, CX_GDSCR);
++	/* Do not attempt a power-down after uncertain hardware completion. */
++	return ETIMEDOUT;
++}
++
++/* A6xx uses odd parity for the payload length and opcode/register fields. */
++static uint32_t
++odd_parity(uint32_t value)
++{
++	unsigned parity = 1;
++	while (value) {
++		parity ^= value & 1u;
++		value >>= 1;
++	}
++	return parity;
++}
++
++static int
++reserve(const struct a618_commands *commands, unsigned count)
++{
++	if (!commands || !commands->words || commands->used > commands->capacity)
++		return EINVAL;
++	if (count > commands->capacity - commands->used)
++		return ENOSPC;
++	return 0;
++}
++
++static uint32_t
++packet7(unsigned opcode, unsigned count)
++{
++	return 0x70000000u | count | (odd_parity(count) << 15) |
++	    (opcode << 16) | (odd_parity(opcode) << 23);
++}
++
++int
++a618_emit_reg_write(struct a618_commands *commands, uint32_t reg, uint32_t value)
++{
++	int error;
++	/* Register indices are DWORD indices, not byte offsets. */
++	if (reg > 0x3ffffu)
++		return EINVAL;
++	error = reserve(commands, 2);
++	if (error)
++		return error;
++	commands->words[commands->used++] = 0x40000001u | (reg << 8) |
++	    (odd_parity(reg) << 27); /* count=1 has odd parity already */
++	commands->words[commands->used++] = value;
++	return 0;
++}
++
++int
++a618_emit_memory_write(struct a618_commands *commands, uint64_t iova, uint32_t value)
++{
++	int error;
++	if ((iova & 3u) || iova >= (1ull << 49))
++		return EINVAL;
++	error = reserve(commands, 4);
++	if (error)
++		return error;
++	commands->words[commands->used++] = packet7(0x3d, 3); /* CP_MEM_WRITE */
++	commands->words[commands->used++] = (uint32_t)iova;
++	commands->words[commands->used++] = (uint32_t)(iova >> 32);
++	commands->words[commands->used++] = value;
++	return 0;
++}
++
++int
++a618_emit_fence(struct a618_commands *commands, uint64_t iova, uint32_t sequence)
++{
++	int error;
++	if ((iova & 3u) || iova >= (1ull << 49))
++		return EINVAL;
++	error = reserve(commands, 5);
++	if (error)
++		return error;
++	commands->words[commands->used++] = packet7(0x46, 4); /* CP_EVENT_WRITE */
++	/* CACHE_FLUSH_TS + IRQ, same event used by MSM a6xx_submit(). */
++	commands->words[commands->used++] = 4u | (1u << 31);
++	commands->words[commands->used++] = (uint32_t)iova;
++	commands->words[commands->used++] = (uint32_t)(iova >> 32);
++	commands->words[commands->used++] = sequence;
++	return 0;
++}
++
++int
++a618_ring_init(struct a618_ring *ring, uint32_t *words, unsigned size,
++    void *cookie, int (*read_rptr)(void *, unsigned *),
++    int (*publish)(void *, unsigned))
++{
++	/* A6xx ring length is a power of two. Keep one slot empty. The
++	 * hardware must already be configured for this length and RPTR=WPTR=0.
++	 */
++	if (!ring || !words || size < 2 || (size & (size - 1)) ||
++	    size > 0x100000u || !read_rptr || !publish)
++		return EINVAL;
++	ring->words = words;
++	ring->size = size;
++	ring->wptr = 0;
++	ring->poisoned = 0;
++	ring->cookie = cookie;
++	ring->read_rptr = read_rptr;
++	ring->publish = publish;
++	return 0;
++}
++
++int
++a618_ring_submit(struct a618_ring *ring, const struct a618_commands *commands)
++{
++	unsigned rptr, available, next;
++	int error;
++	if (!ring || !ring->words || !ring->read_rptr || !ring->publish ||
++	    ring->size < 2 || (ring->size & (ring->size - 1)) ||
++	    ring->wptr >= ring->size || !commands || !commands->words ||
++	    !commands->used || commands->used > commands->capacity)
++		return EINVAL;
++	if (ring->poisoned)
++		return EIO;
++	if (commands->used >= ring->size)
++		return ENOSPC;
++	error = ring->read_rptr(ring->cookie, &rptr);
++	if (error || rptr >= ring->size) {
++		ring->poisoned = 1;
++		return error ? error : EIO;
++	}
++	available = (rptr - ring->wptr - 1) & (ring->size - 1);
++	if (commands->used > available)
++		return EAGAIN; /* Caller may retry with a deadline, never busy-spin. */
++	next = ring->wptr;
++	for (unsigned i = 0; i < commands->used; ++i) {
++		ring->words[next] = commands->words[i];
++		next = (next + 1) & (ring->size - 1);
++	}
++	error = ring->publish(ring->cookie, next);
++	if (error) {
++		ring->poisoned = 1;
++		return error;
++	}
++	ring->wptr = next;
++	return 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_adreno.h b/bsd/dev/sweet_adreno.h
+new file mode 100644
+index 0000000..d6462ff
+--- /dev/null
++++ b/bsd/dev/sweet_adreno.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: MIT
++ * SWEET A618 hardware core. See docs/adreno-port.md for provenance/status.
++ */
++#ifndef SWEET_ADRENO_H
++#define SWEET_ADRENO_H
++#if defined(KERNEL)
++#include <sys/types.h>
++#else
++#include <stdint.h>
++#endif
++
++/* Offsets are bytes relative to the aperture supplied in cookie.
++ * write() must order prior stores and complete the MMIO store before return.
++ * The caller serializes device operations and keeps the rails voted on.
++ */
++struct a618_io {
++	void *cookie;
++	uint32_t (*read)(void *, uint32_t);
++	void (*write)(void *, uint32_t, uint32_t);
++	void (*delay_us)(void *, unsigned);
++};
++struct a618_power_result {
++	uint32_t control;
++	uint32_t status;
++	unsigned waited_us;
++};
++int a618_enable_cx(const struct a618_io *, struct a618_power_result *);
++
++/* CPU-side PM4 builder. No allocation, MMIO, firmware loading or submission.
++ * Caller supplies private, writable storage and owns all referenced IOVAs.
++ * A failed append leaves both the buffer and used count unchanged.
++ */
++struct a618_commands {
++	uint32_t *words;
++	unsigned capacity;
++	unsigned used;
++};
++int a618_emit_reg_write(struct a618_commands *, uint32_t, uint32_t);
++int a618_emit_memory_write(struct a618_commands *, uint64_t, uint32_t);
++int a618_emit_fence(struct a618_commands *, uint64_t, uint32_t);
++
++/* Single producer ring transport. Caller holds its device lock for init and
++ * submit, supplies coherent memory (or syncs it in publish), and guarantees
++ * CP/SQE, SMMU, power and clocks are initialized before attaching this ring.
++ * publish synchronizes the ENTIRE ring for DMA, orders writes, then writes
++ * CP_RB_WPTR. A failure poisons the ring: hardware ownership is uncertain.
++ * This API accepts trusted kernel-built packets only, never userspace PM4.
++ */
++struct a618_ring {
++	uint32_t *words;
++	unsigned size;
++	unsigned wptr;
++	int poisoned;
++	void *cookie;
++	int (*read_rptr)(void *, unsigned *);
++	int (*publish)(void *, unsigned);
++};
++int a618_ring_init(struct a618_ring *, uint32_t *, unsigned, void *,
++    int (*)(void *, unsigned *), int (*)(void *, unsigned));
++int a618_ring_submit(struct a618_ring *, const struct a618_commands *);
++
++/* postmarketOS SM7150 clock path; GX remains controlled by GMU firmware.
++ * Requires live CX power and parent MX/CX votes maintained by the caller.
++ * PLL0 must already be running at 600 MHz. Its rate is never changed.
++ * A failure leaves enabled clocks held and stops further operations.
++ */
++struct a618_clock_result {
++	unsigned block; /* 0 = GPUCC, 1 = GCC */
++	uint32_t offset;
++	uint32_t value;
++	unsigned completed;
++};
++int a618_enable_gmu_clocks(const struct a618_io *, const struct a618_io *,
++    struct a618_clock_result *);
++
++/* GMU-relative byte offsets, adjusted from Freedreno DWORD register IDs. */
++#define A618_GMU_SYSRESET 0x14000u
++#define A618_GMU_FW_INIT_RESULT 0x14070u
++#define A618_GMU_POWER_STATUS 0x14340u
++#define A618_GMU_AHB_FENCE_STATUS 0x24c4cu
++#define A618_GMU_ITCM 0x3000u
++int a618_gmu_stage_legacy(const struct a618_io *, const unsigned char *,
++    unsigned, uint32_t, unsigned *);
++#endif
+diff --git a/bsd/dev/sweet_adreno_clock.c b/bsd/dev/sweet_adreno_clock.c
+new file mode 100644
+index 0000000..d43cd8c
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_clock.c
+@@ -0,0 +1,239 @@
++/* SPDX-License-Identifier: MIT
++ * Copyright (c) 2026 ios-sweet contributors
++ *
++ * SM7150 clock and firmware-staging implementation using public Qualcomm
++ * interfaces. Source references: docs/adreno-port.md (postmarketOS section).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno.h"
++
++static int
++io_valid(const struct a618_io *io)
++{
++	return io && io->read && io->write && io->delay_us;
++}
++
++static int
++read_checked(const struct a618_io *io, unsigned block, uint32_t offset,
++    struct a618_clock_result *result)
++{
++	result->block = block;
++	result->offset = offset;
++	result->value = io->read(io->cookie, offset);
++	return result->value == 0xffffffffu ? EIO : 0;
++}
++
++static int
++update(const struct a618_io *io, unsigned block, uint32_t offset,
++    uint32_t mask, uint32_t value, struct a618_clock_result *result)
++{
++	int error = read_checked(io, block, offset, result);
++	if (error)
++		return error;
++	io->write(io->cookie, offset, (result->value & ~mask) | value);
++	error = read_checked(io, block, offset, result);
++	if (error)
++		return error;
++	return (result->value & mask) == value ? 0 : EIO;
++}
++
++static int
++poll(const struct a618_io *io, unsigned block, uint32_t offset,
++    uint32_t mask, uint32_t expected, struct a618_clock_result *result)
++{
++	for (unsigned elapsed = 0; elapsed < 500; ++elapsed) {
++		int error = read_checked(io, block, offset, result);
++		if (error)
++			return error;
++		if ((result->value & mask) == expected)
++			return 0;
++		io->delay_us(io->cookie, 1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++branch(const struct a618_io *io, unsigned block, uint32_t offset,
++    struct a618_clock_result *result)
++{
++	int error = update(io, block, offset, 1, 1, result);
++	if (error)
++		return error;
++	/* A running NOC FSM may report bit31 set; match Linux branch2 semantics. */
++	for (unsigned elapsed = 0; elapsed < 500; ++elapsed) {
++		error = read_checked(io, block, offset, result);
++		if (error)
++			return error;
++		if (!(result->value & (1u << 31)) ||
++		    ((result->value >> 28) & 7u) == 2) {
++			++result->completed;
++			return 0;
++		}
++		io->delay_us(io->cookie, 1);
++	}
++	return ETIMEDOUT;
++}
++
++int
++a618_enable_gmu_clocks(const struct a618_io *gpucc,
++    const struct a618_io *gcc, struct a618_clock_result *result)
++{
++	int error;
++	if (!result || !io_valid(gpucc) || !io_valid(gcc))
++		return EINVAL;
++	result->block = result->completed = 0;
++	result->offset = result->value = 0;
++	/* CX power and software control must still be established. */
++	error = read_checked(gpucc, 0, 0x106c, result);
++	if (error)
++		return error;
++	if (result->value & 3u)
++		return EAGAIN;
++	error = read_checked(gpucc, 0, 0x1540, result);
++	if (error)
++		return error;
++	if (!(result->value & (1u << 31)))
++		return EAGAIN;
++
++	/* GPLL0 is a shared, fixed FABIA PLL. Check 19.2 MHz * 31.25 = 600 MHz
++	 * before voting its output. Never reprogram this system PLL.
++	 */
++	error = read_checked(gcc, 1, 0x4, result);
++	if (error)
++		return error;
++	if (result->value != 31)
++		return ERANGE;
++	error = read_checked(gcc, 1, 0x38, result);
++	if (error)
++		return error;
++	if (result->value != 0x4000)
++		return ERANGE;
++	error = read_checked(gcc, 1, 0, result);
++	if (error)
++		return error;
++	if (result->value & (1u << 20)) {
++		/* FABIA in vote-FSM mode: Linux waits for ACTIVE, not LOCK_DET. */
++		error = update(gcc, 1, 0x52000, 1, 1, result);
++		if (!error)
++			error = poll(gcc, 1, 0, 1u << 30, 1u << 30, result);
++	} else {
++		/* Preserve an already running direct-control PLL. Its rate was
++		 * checked above; do not change MODE/OPMODE or pretend a vote
++		 * can start a PLL which is not under vote-FSM control.
++		 */
++		if ((result->value & ((1u << 31) | 1u)) != ((1u << 31) | 1u))
++			return EBUSY;
++		error = read_checked(gcc, 1, 0x2c, result);
++		if (!error && result->value != 1)
++			error = EBUSY;
++	}
++	if (error)
++		return error;
++	/* GCC_GPU_GPLL0_DIV_CLK_SRC: fixed divide by two, 300 MHz. */
++	error = update(gcc, 1, 0x52004, 1u << 16, 1u << 16, result);
++	if (error)
++		return error;
++	gcc->delay_us(gcc->cookie, 10);
++	/* Bus clocks named by the postmarketOS GMU and SMMU DT nodes. */
++	static const uint32_t bus[] = { 0x4452c, 0x7100c, 0x71018 };
++	for (unsigned i = 0; i < sizeof(bus) / sizeof(bus[0]); ++i) {
++		error = branch(gcc, 1, bus[i], result);
++		if (error)
++			return error;
++	}
++	/* SM7150 GMU requests CXO; its SMMU requests GPUCC AHB and GCC
++	 * GPU_SNOC_DVM_GFX. Neither requests GPUCC CXO_AON or CX_SNOC_DVM.
++	 * Those extra gates reject enable on sweet. Use the DT dependencies
++	 * and retain status checks on each required branch. No GX clock or
++	 * GPUCC PLL0/PLL1 register is touched.
++	 */
++	error = branch(gpucc, 0, 0x109c, result);
++	if (!error)
++		error = branch(gpucc, 0, 0x1078, result);
++	if (error)
++		return error;
++	/* RCG2 force-enable while selecting/dividing the existing GCC parent. */
++	error = update(gpucc, 0, 0x1120, 2, 2, result);
++	if (error)
++		return error;
++	error = poll(gpucc, 0, 0x1120, 1u << 31, 0, result);
++	if (error)
++		return error;
++	/* SRC_SEL=6, HID_DIV=2: 300 MHz * 2 / (2+1) = 200 MHz. */
++	error = update(gpucc, 0, 0x1124, 0x10371fu, 0x602, result);
++	if (error)
++		return error;
++	/* UPDATE is self-clearing; do not require immediate readback of bit0. */
++	error = read_checked(gpucc, 0, 0x1120, result);
++	if (error)
++		return error;
++	gpucc->write(gpucc->cookie, 0x1120, result->value | 1u);
++	error = poll(gpucc, 0, 0x1120, 1, 0, result);
++	if (error)
++		return error;
++	error = read_checked(gpucc, 0, 0x1124, result);
++	if (error)
++		return error;
++	if ((result->value & 0x10371fu) != 0x602)
++		return EIO;
++	/* Source probe recommends all four WAKE/SLEEP bits before GMU enable. */
++	error = update(gpucc, 0, 0x1098, 0xff0, 0xff0, result);
++	if (!error)
++		error = branch(gpucc, 0, 0x1098, result);
++	/* Leave the root held on for staging; shutdown belongs to the runtime
++	 * state machine once firmware and SMMU execution are implemented.
++	 */
++	return error;
++}
++
++static uint32_t
++little_word(const unsigned char *data)
++{
++	return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
++	    ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
++}
++
++int
++a618_gmu_stage_legacy(const struct a618_io *gmu, const unsigned char *firmware,
++    unsigned size, uint32_t expected_crc, unsigned *verified)
++{
++	uint32_t crc = 0xffffffffu, sp, pc, reset;
++	if (!verified)
++		return EINVAL;
++	*verified = 0;
++	if (!io_valid(gmu) || !firmware || size != 0x8000)
++		return EINVAL;
++	/* Validate all data before issuing any MMIO. */
++	sp = little_word(firmware);
++	pc = little_word(firmware + 4);
++	if ((sp & 7) || sp < 0x40000 || sp > 0x44000 || !(pc & 1) ||
++	    (pc & ~1u) >= size)
++		return EINVAL;
++	for (unsigned i = 0; i < size; ++i) {
++		crc ^= firmware[i];
++		for (unsigned bit = 0; bit < 8; ++bit)
++			crc = (crc >> 1) ^ ((0u - (crc & 1u)) & 0xedb88320u);
++	}
++	if ((crc ^ 0xffffffffu) != expected_crc)
++		return EIO;
++	reset = gmu->read(gmu->cookie, A618_GMU_SYSRESET);
++	if (reset == 0xffffffffu)
++		return EIO;
++	if (!(reset & 1))
++		return EBUSY; /* Never overwrite a potentially running processor. */
++	for (unsigned offset = 0; offset < size; offset += 4) {
++		uint32_t word = little_word(firmware + offset);
++		gmu->write(gmu->cookie, A618_GMU_ITCM + offset, word);
++		if (gmu->read(gmu->cookie, A618_GMU_ITCM + offset) != word)
++			return EIO;
++		*verified += 4;
++	}
++	reset = gmu->read(gmu->cookie, A618_GMU_SYSRESET);
++	return reset != 0xffffffffu && (reset & 1) ? 0 : EIO;
++}
++#endif
+diff --git a/bsd/dev/sweet_adreno_pas.c b/bsd/dev/sweet_adreno_pas.c
+new file mode 100644
+index 0000000..27d080f
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_pas.c
+@@ -0,0 +1,117 @@
++/* SPDX-License-Identifier: MIT
++ * Restricted SM7150 signed-ZAP PAS transport (public Qualcomm SCM protocol).
++ * No generic SCM entry point, memory-assignment or security-register bypass.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include "sweet_adreno_cp.h"
++static uint32_t
++le32(const unsigned char *p)
++{
++ return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static int
++scm(unsigned service, unsigned command, uint64_t arguments,
++ uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
++ struct a618_pas_result *result)
++{
++ uint64_t function = 0x42000000u | (service << 8) | command;
++ for (unsigned busy = 0; busy < 5; ++busy) {
++  uint64_t resume = function, quirk_a6 = 0;
++  for (unsigned interrupted = 0; interrupted < 32; ++interrupted) {
++   register uint64_t x0 __asm__("x0") = resume;
++   register uint64_t x1 __asm__("x1") = arguments;
++   register uint64_t x2 __asm__("x2") = arg0;
++   register uint64_t x3 __asm__("x3") = arg1;
++   register uint64_t x4 __asm__("x4") = arg2;
++   register uint64_t x5 __asm__("x5") = arg3;
++   register uint64_t x6 __asm__("x6") = quirk_a6;
++   register uint64_t x7 __asm__("x7") = 0;
++   __asm__ volatile("dsb sy\n\tsmc #0\n\tdsb sy" :
++       "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++       "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7) : :
++       "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++       "x16", "x17", "memory", "cc");
++   result->status = (int64_t)x0;
++   result->response = x1;
++   if (x0 == 1) { resume = 1; quirk_a6 = x6; continue; }
++   if ((int64_t)x0 == -12) break; /* bounded busy retry */
++   if (x0) return x0 == (uint64_t)-1 ? ENOTSUP : EIO;
++   return 0;
++  }
++  if (result->status != -12) return ETIMEDOUT;
++  if (busy != 4) delay(30000);
++ }
++ return EBUSY;
++}
++/* Public SCM aperture protocol used by the pinned Linux Adreno driver.
++ * Availability is optional; an advertised call that fails is fatal. The four
++ * arguments fit x2..x5 directly, so no shared extended-argument buffer exists.
++ * This entry cannot select another context or issue arbitrary SCM commands. */
++int
++a618_cp_configure_aperture(struct a618_pas_result *result)
++{
++ if (!result) return EINVAL;
++ *result = (struct a618_pas_result){ .phase = 1 };
++ int error = scm(6, 1, 1, 0x02000c1b, 0, 0, 0, result);
++ /* Linux treats a failed availability query as unavailable. It has no
++  * configuration side effects; retain raw status for the boot log. */
++ if (error) return 0;
++ if (!result->response) return 0; /* optional MP command unavailable */
++ result->phase = 2;
++ error = scm(0x0c, 0x1b, 4, 0xffff0000, 0xffffffffu,
++     0xffffffffu, 0xffffffffu, result);
++ if (error) return error;
++ result->phase = 3;
++ return 0;
++}
++int
++a618_zap_authenticate(volatile uint32_t *reserved, uint64_t physical,
++ const struct a618_dma_region *metadata, const unsigned char *mdt,
++ unsigned mdt_bytes, const unsigned char *code, unsigned code_bytes,
++ struct a618_pas_result *result)
++{
++ if (!result) return EINVAL;
++ *result = (struct a618_pas_result){0};
++ if (!reserved || physical != 0x97f15000ull || !metadata || !metadata->cpu ||
++     metadata->bytes != 0x4000 || !metadata->uncached ||
++     !metadata->physical || (metadata->physical & 0x3fff) ||
++     metadata->physical >= (1ull << 36) || !mdt || !code ||
++     mdt_bytes != 0x1acc || code_bytes != 0x7c0 ||
++     le32(mdt) != 0x464c457f || mdt[4] != 1 || mdt[5] != 1 ||
++     le32(mdt + 28) != 52 || (le32(mdt + 44) & 0xffff) != 3 || le32(mdt + 40) != 0x00200034 ||
++     le32(mdt + 52 + 2 * 32) != 1 ||
++     le32(mdt + 52 + 2 * 32 + 12) != 0x5000 ||
++     le32(mdt + 52 + 2 * 32 + 16) != code_bytes ||
++     le32(mdt + 52 + 2 * 32 + 20) != code_bytes ||
++     le32(mdt + 52 + 2 * 32 + 24) != 0x08000007) return EINVAL;
++ result->phase = 1;
++ const unsigned commands[] = {1, 2, 5};
++ for (unsigned i = 0; i < 3; ++i) {
++  int error = scm(6, 1, 1, 0x02000200u | commands[i], 0, 0, 0, result);
++  if (error) return error;
++  if (!result->response) return ENOTSUP;
++ }
++ volatile uint32_t *words = (volatile uint32_t *)metadata->cpu;
++ for (unsigned i = 0; i < mdt_bytes / 4; ++i) words[i] = le32(mdt + i * 4);
++ __asm__ volatile("dsb sy" ::: "memory");
++ result->phase = 2;
++ int error = scm(2, 1, 0x82, 13, metadata->physical, 0, 0, result);
++ if (error || result->response) return error ? error : EACCES;
++ /* TZ may now protect metadata. Retain its separate page and do not read,
++  * modify, free or reuse it, including on errors below. */
++ result->phase = 3;
++ error = scm(2, 2, 3, 13, physical, 0x1000, 0, result);
++ if (error || result->response) return error ? error : EACCES;
++ for (unsigned i = 0; i < 0x1000 / 4; ++i) reserved[i] = 0;
++ for (unsigned i = 0; i < code_bytes / 4; ++i) reserved[i] = le32(code + i * 4);
++ __asm__ volatile("dsb sy" ::: "memory");
++ result->phase = 4;
++ error = scm(2, 5, 1, 13, 0, 0, 0, result);
++ if (error || result->response) return error ? error : EACCES;
++ result->phase = 5;
++ return 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_adreno_smmu.c b/bsd/dev/sweet_adreno_smmu.c
+new file mode 100644
+index 0000000..e27c05c
+--- /dev/null
++++ b/bsd/dev/sweet_adreno_smmu.c
+@@ -0,0 +1,157 @@
++/* SPDX-License-Identifier: MIT
++ * Original bounded SMMUv2 backend using the ARM architecture and public
++ * Linux/Qualcomm register protocols. See docs/adreno-port.md for source pins.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(KERNEL)
++#include <sys/errno.h>
++#else
++#include <errno.h>
++#endif
++#include "sweet_adreno_dma.h"
++#define CB1 0x9000u
++#define ASID 0x61u
++/* FSR.Format[10:9] is read-only metadata, not a W1C fault. */
++#define FSR_FAULT 0xc00001feu
++static int
++put(const struct a618_io *io, uint32_t offset, uint32_t value,
++ uint32_t mask, struct a618_smmu_result *r)
++{
++ io->write(io->cookie, offset, value);
++ r->offset = offset; r->value = io->read(io->cookie, offset);
++ return r->value != 0xffffffffu && (r->value & mask) == (value & mask) ? 0 : EIO;
++}
++static int
++wait_clear(const struct a618_io *io, uint32_t offset, unsigned mask,
++ struct a618_smmu_result *r)
++{
++ for (unsigned i = 0; i < 500; ++i) {
++  r->offset = offset; r->value = io->read(io->cookie, offset);
++  if (r->value == 0xffffffffu) return EIO;
++  if (!(r->value & mask)) return 0;
++  io->delay_us(io->cookie, 1);
++ }
++ return ETIMEDOUT;
++}
++int
++a618_smmu_prepare(const struct a618_smmu_io *ops,
++ const struct a618_dma_region *memory, struct a618_smmu_result *r)
++{
++ if (!ops || !memory || !r || !ops->registers.read ||
++     !ops->registers.write || !ops->registers.delay_us ||
++     !ops->read64 || !ops->write64 || !ops->barrier || !memory->cpu ||
++     !memory->uncached || memory->bytes != A618_DMA_BYTES ||
++     (memory->physical & 0x3fff) || !memory->physical ||
++     memory->physical > (1ull << 36) - A618_DMA_BYTES ||
++     ((uintptr_t)memory->cpu & 7)) return EINVAL;
++ const struct a618_io *io = &ops->registers;
++ *r = (struct a618_smmu_result){ .context = 1, .slot = 0xffffffffu };
++ /* Measured 0091 profile: 4 KiB register pages, 0x8000 CB base, five
++  * stream match slots and context banks, 36-bit PA. 16K PT granules are
++  * intentionally not used (Qualcomm advertises broken 16K support).
++  */
++ const uint32_t identity[] = {0x48016605, 0x20008005, 0x7511};
++ for (unsigned i = 0; i < 3; ++i) {
++  r->offset = 0x20 + 4 * i; r->value = io->read(io->cookie, r->offset);
++  if (r->value != identity[i]) return ENOTSUP;
++ }
++ /* Do not steal an active bank or matching stream, even if its firmware
++  * owner appears idle. CB0 and all protected banks are left alone.
++  */
++ r->offset = CB1; r->value = io->read(io->cookie, CB1);
++ if (r->value == 0xffffffffu) return EIO;
++ if (r->value & 1) return EBUSY; /* M=0 is disabled; other reset bits may be UNKNOWN. */
++ for (unsigned i = 0; i < 5; ++i) {
++  r->offset = 0x800 + 4 * i;
++  uint32_t smr = r->value = io->read(io->cookie, r->offset);
++  if (smr == 0xffffffffu) return EIO;
++  if (!(smr & 0x80000000u)) {
++   if (r->slot == 0xffffffffu) r->slot = i;
++  } else if (((smr ^ 5u) & ~((smr >> 16) & 0x7fffu) & 0xffffu) == 0) {
++   r->slot = i; return EBUSY;
++  }
++ }
++ if (r->slot == 0xffffffffu) return ENOSPC;
++ r->control = io->read(io->cookie, 0);
++ if (r->control == 0xffffffffu) return EIO;
++ /* Three 4K tables inside a 16K host page; no mapping of the table arena.
++  * L1[1] -> L2[256] -> L3[0..15]: shared 64K at 0x60000000.
++  * All other entries fault. Both privileged/unprivileged data R/W, NX,
++  * Normal NC and outer shareable match the uncached CPU mapping.
++  */
++ volatile uint64_t *l1 = (volatile uint64_t *)memory->cpu;
++ volatile uint64_t *l2 = (volatile uint64_t *)(memory->cpu + 0x1000);
++ volatile uint64_t *l3 = (volatile uint64_t *)(memory->cpu + 0x2000);
++ for (unsigned i = 0; i < 512; ++i) l1[i] = l2[i] = l3[i] = 0;
++ l1[1] = (memory->physical + 0x1000) | 3;
++ l2[256] = (memory->physical + 0x2000) | 3;
++ for (unsigned i = 0; i < 16; ++i)
++  l3[i] = (memory->physical + A618_TABLE_BYTES + 0x1000 * i) |
++      (3ull << 53) | (1u << 11) | (1u << 10) | (2u << 8) | (1u << 6) | 3;
++ ops->barrier(io->cookie);
++ int error;
++ #define SET(o,v,m) do { error = put(io, (o), (v), (m), r); if (error) return error; } while (0)
++ SET(0x1804, 1, 1); /* GR1 CBA2R(1): AArch64. */
++ SET(0x1004, 0x1f300, 0x3f3ff); /* Stage1, stage2 bypass, weak upstream attributes. */
++ SET(CB1 + 0x10, 0x38011, 0x38077); /* TCR2: SEP upstream, 36-bit output, AArch64 ASID. */
++ SET(CB1 + 0x30, 0x00802020u, 0x00c0ffbfu); /* EPD1, OSH, NC walks, T0SZ=32; AArch64, no EAE. */
++ uint64_t ttbr = memory->physical | ((uint64_t)ASID << 48);
++ ops->write64(io->cookie, CB1 + 0x20, ttbr);
++ r->offset = CB1 + 0x20;
++ r->par = ops->read64(io->cookie, r->offset);
++ if ((r->par & 0xffff000ffffff000ull) != ttbr) return EIO;
++ ops->write64(io->cookie, CB1 + 0x28, 0);
++ SET(CB1 + 0x38, 0x44, 0xff); /* MAIR[0]: Normal NC. */
++ /* MAIR1 is unused: every data PTE references MAIR0[0]. */
++ /* Fault reporting enabled, IRQ/stalling disabled until an IRQ handler
++  * exists; HUPCF continues other transactions after an abort.
++  */
++ /* AFE/TRE are UNK/SBOP for long descriptors: write ones, do not
++  * compare their readback. Check M, E, fault controls, WXN and ASIDPNE.
++  */
++ SET(CB1, 0x1127, 0x17f1);
++ /* Block unmatched streams and enable this device. Preserve other controls;
++  * do not enable interrupt sources without handlers. No reset-all/TLBI-all.
++  */
++ SET(0, (r->control | 0x1c12u) & ~0xe025u, 0xfc37);
++ io->write(io->cookie, CB1 + 0x610, ASID);
++ io->write(io->cookie, CB1 + 0x7f0, 0);
++ error = wait_clear(io, CB1 + 0x7f4, 1, r);
++ if (error) return error;
++ /* Hardware translation probes, not a software table walk: every shared
++  * page plus a guard fault must match before the stream is published.
++  */
++ for (unsigned i = 0; i <= 16; ++i) {
++  uint64_t va = (uint64_t)A618_SHARED_IOVA + i * 0x1000u;
++  ops->write64(io->cookie, CB1 + 0x800, va);
++  error = wait_clear(io, CB1 + 0x8f0, 1, r);
++  if (error) return error;
++  r->par = ops->read64(io->cookie, CB1 + 0x50);
++  if (r->par == 0xffffffffffffffffull) return EIO;
++  if (i == 16) {
++   if (!(r->par & 1)) return EFAULT;
++  } else {
++   uint64_t expected = memory->physical + A618_TABLE_BYTES + i * 0x1000u;
++   if ((r->par & 1) || (r->par & 0x0000000ffffff000ull) != expected)
++    return EFAULT;
++   ++r->translated;
++  }
++ }
++ r->fault = io->read(io->cookie, CB1 + 0x58);
++ if (r->fault == 0xffffffffu) return EIO;
++ if (r->fault & (1u << 30)) return EBUSY; /* Never resume an unknown stall. */
++ if (r->fault & FSR_FAULT) {
++  io->write(io->cookie, CB1 + 0x58, r->fault & (FSR_FAULT & ~(1u << 30)));
++  uint32_t after = io->read(io->cookie, CB1 + 0x58);
++  if (after == 0xffffffffu || (after & FSR_FAULT)) return EIO;
++ }
++ /* Only GMU kernel stream 5: route first, VALID last. Never program
++  * GMU user stream 4, GPU stream 0, broad masks or a bypass entry.
++  */
++ SET(0xc00 + 4 * r->slot, 1, 0x030300ff);
++ SET(0x800 + 4 * r->slot, 0x80000005u, 0xffffffffu);
++ r->fault = io->read(io->cookie, CB1 + 0x58);
++ #undef SET
++ return r->fault == 0xffffffffu || (r->fault & FSR_FAULT) ? EIO : 0;
++}
++#endif
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
+index 0000000..638a4d5
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,808 @@
++/*
++ * SWEET Adreno 618 bring-up. sweetgpu=1 reads GPUCC and command DB only.
++ * sweetgpu=2 adds deferred RPMh ARC READ transactions after touch power.
++ * sweetgpu=3 additionally raises only gfx.lvl and verifies the readback.
++ * sweetgpu=4 uses the new A618 core to power CX after fresh rail checks.
++ * sweetgpu=5 enables GMU/bus clocks and reads CX-side GMU/SMMU status.
++ * sweetgpu=6 additionally stages firmware while the M3 remains in reset.
++ * sweetgpu=7 additionally validates SMMU mappings and prepares HFI RAM.
++ * sweetgpu=8 cold-starts legacy GMU and exchanges real HFI messages.
++ * GX is firmware controlled. No CP/SQE or graphics submission yet.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/errno.h>
++#include "sweet_adreno.h"
++#include "sweet_adreno_cp.h"
++#include "sweet_adreno_dma.h"
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_arc_probe(const char *res);
++extern int sweet_rpmh_arc_read(const char *res);
++extern int sweet_rpmh_arc_require(const char *res, unsigned minimum);
++extern int sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level);
++void sweet_gpu_probe(void);
++
++
++/* LOW_SVS is the first safe GPU corner; the write only raises gfx.lvl. */
++#define SWEET_GPU_GFX_TARGET 65u
++
++#define SWEET_GPUCC_PA       0x05090000u
++#define SWEET_GPUCC_SIZE     0x00009000u
++#define SWEET_GCC_PA         0x00100000u
++#define SWEET_GCC_SIZE       0x00072000u
++#define SWEET_GMU_PA         0x0506a000u
++#define SWEET_GMU_SIZE       0x00031000u
++#define SWEET_SMMU_PA        0x05040000u
++#define SWEET_SMMU_SIZE      0x00010000u
++#define GPU_CC_GX_BCR        0x1008u
++#define GPU_CC_GX_GDSCR      0x100cu
++#define GPU_CC_CX_GDSCR      0x106cu
++#define GPU_CC_CBCR_AHB      0x1078u
++#define GPU_CC_GX_DOMAIN     0x1508u
++#define GPU_CC_CX_HW_CTRL    0x1540u
++#define GDSC_PWR_ON          (1u << 31)
++#define GDSC_SW_COLLAPSE     (1u << 0)
++#define GDSC_HW_CONTROL      (1u << 1)
++#define GX_DOMAIN_CLAMP      (1u << 0)
++#define GX_BCR_BLK_ARES      (1u << 0)
++#define BRANCH_CLK_OFF       (1u << 31)
++#define BRANCH_CLK_ENABLE    (1u << 0)
++
++static vm_offset_t sweet_gpucc;
++static int sweet_gpu_probe_attempted;
++static int sweet_gpu_stage;
++
++/* All registers below are in GPUCC; none is in the Adreno/GMU aperture. */
++static const struct {
++	const char *name;
++	uint32_t offset;
++} sweet_gpu_branches[] = {
++	{ "AHB",          0x1078u },
++	{ "CX_APB",       0x1088u },
++	{ "CX_SNOC_DVM",  0x108cu },
++	{ "CX_GMU",       0x1098u },
++	{ "CXO",          0x109cu },
++	{ "CX_GFX3D",     0x10a4u },
++	{ "CX_GFX3D_SLV", 0x10a8u },
++	{ "GX_GFX3D",     0x1054u },
++	{ "GX_CXO",       0x1060u },
++	{ "GX_GMU",       0x1064u },
++};
++
++static uint32_t
++sweet_gpucc_read(uint32_t offset)
++{
++	uint32_t value = *(volatile uint32_t *)(sweet_gpucc + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++/* XNU adapter: cookie is the mapped aperture base. */
++static uint32_t
++sweet_adreno_read(void *cookie, uint32_t offset)
++{
++	uint32_t value = *(volatile uint32_t *)((vm_offset_t)cookie + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++static void
++sweet_adreno_write(void *cookie, uint32_t offset, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)((vm_offset_t)cookie + offset) = value;
++	__asm__ volatile("dsb oshst" ::: "memory");
++	(void)sweet_adreno_read(cookie, offset);
++}
++
++static uint64_t
++sweet_adreno_read64(void *cookie, uint32_t offset)
++{
++ uint64_t value = *(volatile uint64_t *)((vm_offset_t)cookie + offset);
++ __asm__ volatile("dmb oshld" ::: "memory");
++ return value;
++}
++static void
++sweet_adreno_write64(void *cookie, uint32_t offset, uint64_t value)
++{
++ __asm__ volatile("dmb oshst" ::: "memory");
++ *(volatile uint64_t *)((vm_offset_t)cookie + offset) = value;
++ __asm__ volatile("dsb oshst" ::: "memory");
++}
++static void
++sweet_adreno_barrier(void *cookie)
++{
++ (void)cookie;
++ __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++sweet_adreno_delay(void *cookie, unsigned usec)
++{
++	(void)cookie;
++	delay(usec);
++}
++
++/*
++ * Pure metadata inspection; valid tables do not establish current votes.
++ */
++static int
++sweet_gpu_arc_tables(void)
++{
++	static const char *const names[] = { "mx.lvl", "cx.lvl", "gfx.lvl" };
++	for (unsigned i = 0; i < 3; ++i) {
++		int error = sweet_rpmh_arc_probe(names[i]);
++		if (error) {
++			printf("SWEET GPU: ARC probe %s failed %d\n", names[i], error);
++			return error;
++		}
++	}
++	printf("SWEET GPU: ARC tables read-only complete\n");
++	return 0;
++}
++
++/* Fresh resource checks belong to this boot, not to a previous stage.
++ * ARC table selectors are the current board interpretation, not a voltage
++ * measurement. Shared rails are never lowered or written by this driver.
++ */
++static int
++sweet_gpu_power_cx(void)
++{
++	struct a618_power_result result;
++	const struct a618_io io = {
++		.cookie = (void *)sweet_gpucc,
++		.read = sweet_adreno_read,
++		.write = sweet_adreno_write,
++		.delay_us = sweet_adreno_delay,
++	};
++	int error = sweet_rpmh_arc_require("mx.lvl", 65);
++	if (!error)
++		error = sweet_rpmh_arc_require("cx.lvl", 65);
++	if (error) {
++		printf("SWEET ADRENO: CX preconditions failed errno=%d; no GPUCC write\n", error);
++		return error;
++	}
++	error = a618_enable_cx(&io, &result);
++	printf("SWEET ADRENO: CX result errno=%d control=%#x status=%#x waited_us=%u\n",
++	    error, result.control, result.status, result.waited_us);
++	return error;
++}
++
++static uint32_t
++sweet_gpu_crc(const unsigned char *bytes, unsigned length)
++{
++ uint32_t crc = 0xffffffffu;
++ for (unsigned i = 0; i < length; ++i) {
++  crc ^= bytes[i];
++  for (unsigned b = 0; b < 8; ++b) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1)));
++ }
++ return ~crc;
++}
++static int
++sweet_gpu_blob(DTEntry node, const char *name, const char *crc_name,
++ const unsigned char **bytes, unsigned *length)
++{
++ const uint32_t *crc;
++ unsigned size = 0;
++ if (SecureDTGetProperty(node, name, (const void **)bytes, length) != kSuccess ||
++     SecureDTGetProperty(node, crc_name, (const void **)&crc, &size) != kSuccess ||
++     size != 4 || *length > 0x8000 || !*length) return ENOENT;
++ return sweet_gpu_crc(*bytes, *length) == *crc ? 0 : EIO;
++}
++struct sweet_gpu_zap_request {
++ volatile uint32_t *reserved;
++ uint64_t physical;
++ const struct a618_dma_region *metadata;
++ const unsigned char *mdt, *code;
++ unsigned mdt_bytes, code_bytes;
++ struct a618_pas_result result;
++};
++static int
++sweet_gpu_zap_prepare(void *cookie)
++{
++ struct sweet_gpu_zap_request *request = cookie;
++ if (!request) return EINVAL;
++ return a618_zap_authenticate(request->reserved, request->physical,
++     request->metadata, request->mdt, request->mdt_bytes, request->code,
++     request->code_bytes, &request->result);
++}
++/*
++ * GPU performance levels from the pinned sm7150.dtsi gpu_opp_table, every
++ * one opp-supported-hw 0x1f (all speed bins): kHz and raw RPMh opp-level.
++ * Bring-up still runs at index 1 (267MHz, the proven corner). After the CP
++ * fence succeeds the APPS gfx/mx floors are raised for the chosen level, the
++ * GX clock is measured, DCVS selects it, and the clock is measured again.
++ * sweetgpukhz=267000 keeps the previous single-level behaviour.
++ */
++static const struct { uint32_t khz, level; } sweet_gpu_opps[] = {
++	{ 267000u, 64u },       /* LOW_SVS */
++	{ 355000u, 128u },      /* SVS */
++	{ 430000u, 192u },      /* SVS_L1 */
++	{ 565000u, 256u },      /* NOM */
++	/* 0132 telemetry: blur-heavy CoreAnimation commits are GPU-bound (13-14
++	 * passes, up to 15.5Mpx, 51-182ms at ~557MHz). OrangeFox KGSL on this
++	 * phone lists 650 and 800MHz; the pinned table pairs them with NOM_L1 and
++	 * TURBO (opp-supported-hw 0x1d / 0x19). */
++	{ 650000u, 320u },      /* NOM_L1 */
++	{ 800000u, 384u },      /* TURBO */
++};
++static unsigned sweet_gpu_opp_mx[6];
++
++static void
++sweet_gpu_levels_prepare(void)
++{
++	uint32_t target = 800000u;
++	PE_parse_boot_argn("sweetgpukhz", &target, sizeof(target));
++	a618_gpu_level_count = 0;
++	unsigned count = 0;
++	for (unsigned i = 0; i < sizeof(sweet_gpu_opps) / sizeof(sweet_gpu_opps[0]); ++i) {
++		if (sweet_gpu_opps[i].khz > target) {
++			break;
++		}
++		uint32_t vote = 0;
++		unsigned mx = 0;
++		int error = sweet_rpmh_adreno_level_vote(sweet_gpu_opps[i].level, &vote, &mx);
++		if (error) {
++			printf("SWEET ADRENO: OPP %u kHz vote errno=%d; single legacy level\n",
++			    sweet_gpu_opps[i].khz, error);
++			return;
++		}
++		a618_gpu_levels[count].vote = vote;
++		a618_gpu_levels[count].khz = sweet_gpu_opps[i].khz;
++		sweet_gpu_opp_mx[count] = mx;
++		++count;
++	}
++	/* Only a table that begins with the proven 267MHz/raw64 corner. */
++	if (count < 2 || (a618_gpu_levels[0].vote >> 16) != 64u) {
++		printf("SWEET ADRENO: OPP table count=%u first=%#x; single legacy level\n",
++		    count, count ? a618_gpu_levels[0].vote : 0);
++		return;
++	}
++	a618_gpu_level_count = count;
++	printf("SWEET ADRENO: OPP table %u levels up to %u kHz (target %u)\n",
++	    count, a618_gpu_levels[count - 1].khz, target);
++}
++
++/* RBBM_PERFCTR_RBBM_0 with countable PERF_RBBM_ALWAYS_COUNT (GX core clock
++ * cycles) against the architected 19.2MHz timer. 0 means not measurable. */
++static uint64_t
++sweet_gpu_counter(vm_offset_t core)
++{
++	uint32_t hi, lo, again;
++	do {
++		hi = sweet_adreno_read((void *)core, 0x41d * 4);
++		lo = sweet_adreno_read((void *)core, 0x41c * 4);
++		again = sweet_adreno_read((void *)core, 0x41d * 4);
++	} while (hi != again);
++	return ((uint64_t)hi << 32) | lo;
++}
++
++static uint32_t
++sweet_gpu_measure_khz(vm_offset_t core)
++{
++	sweet_adreno_write((void *)core, 0x500 * 4, 1);         /* RBBM_PERFCTR_CNTL */
++	sweet_adreno_write((void *)core, 0x507 * 4, 0);         /* RBBM_SEL_0: ALWAYS_COUNT */
++	sweet_adreno_barrier(NULL);
++	delay(100);
++	const uint64_t c0 = sweet_gpu_counter(core), t0 = mach_absolute_time();
++	delay(20000);
++	const uint64_t c1 = sweet_gpu_counter(core), t1 = mach_absolute_time();
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	if (!ns || c1 <= c0 || (c1 >> 63) || c0 == 0xffffffffffffffffULL) {
++		return 0;
++	}
++	return (uint32_t)(((c1 - c0) * 1000000ULL) / ns);
++}
++
++/* Read-only GPUCC view of the real GX clock (Lineage gpucc-sm6150.c): alpha
++ * PLLs at +0x0/+0x100 (L +4, ALPHA +8, ALPHA_U +0xc, USER_CTL +0x10) feed
++ * gpu_cc_gx_gfx3d_clk_src (CMD_RCGR 0x101c, CFG 0x1020: SRC_SEL [10:8],
++ * SRC_DIV [4:0]) through a CRC divider. Logged raw with the VCO estimate. */
++static void
++sweet_gpu_clock_regs(const char *tag)
++{
++	if (!sweet_gpucc) {
++		return;
++	}
++	for (unsigned pll = 0; pll < 2; ++pll) {
++		const uint32_t base = pll * 0x100u;
++		const uint32_t l = sweet_gpucc_read(base + 0x4) & 0xffffu;
++		const uint32_t alpha = sweet_gpucc_read(base + 0x8), alpha_u = sweet_gpucc_read(base + 0xc) & 0xffu;
++		const uint64_t frac = ((uint64_t)alpha_u << 32) | alpha;
++		const uint64_t khz = 19200ULL * l + ((19200ULL * frac) >> 40);
++		printf("SWEET ADRENO: %s GPU PLL%u mode=%#x L=%u alpha=%#llx user_ctl=%#x vco~%llu kHz\n", tag, pll,
++		    sweet_gpucc_read(base), l, (unsigned long long)frac, sweet_gpucc_read(base + 0x10), (unsigned long long)khz);
++	}
++	const uint32_t cmd = sweet_gpucc_read(0x101c), cfg = sweet_gpucc_read(0x1020);
++	printf("SWEET ADRENO: %s gfx3d RCG cmd=%#x cfg=%#x src_sel=%u src_div=%u crc_fsm=%#x crc_mnd=%#x\n", tag, cmd, cfg,
++	    (cfg >> 8) & 7, cfg & 0x1f, sweet_gpucc_read(0x1024), sweet_gpucc_read(0x1028));
++}
++
++static void
++sweet_gpu_raise_clock(vm_offset_t core, vm_offset_t gmu)
++{
++	sweet_gpu_clock_regs("before DCVS");
++	const uint32_t before = sweet_gpu_measure_khz(core);
++	printf("SWEET ADRENO: GX clock measured=%u kHz at perf index 1 (configured %u kHz)\n",
++	    before, a618_gpu_level_count ? a618_gpu_levels[0].khz : 267000u);
++	if (a618_gpu_level_count < 2) {
++		return;
++	}
++	const unsigned top = a618_gpu_level_count - 1;
++	const unsigned gfx_vlvl = (a618_gpu_levels[top].vote >> 16) + 1;   /* ARC consumer level */
++	const unsigned mx_vlvl = sweet_gpu_opp_mx[top] + 1;
++	int error = sweet_rpmh_arc_raise("mx.lvl", mx_vlvl);
++	if (!error) {
++		error = sweet_rpmh_arc_raise("gfx.lvl", gfx_vlvl);
++	}
++	if (error) {
++		printf("SWEET ADRENO: APPS rail floor errno=%d; GX stays at perf index 1\n", error);
++		return;
++	}
++	const struct a618_io gmu_io = {(void *)gmu,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++	error = a618_gmu_dcvs(&gmu_io, top + 1);
++	const uint32_t after = sweet_gpu_measure_khz(core);
++	printf("SWEET ADRENO: DCVS perf index %u (%u kHz, gfx vlvl %u, mx vlvl %u) errno=%d; GX clock measured=%u kHz\n",
++	    top + 1, a618_gpu_levels[top].khz, gfx_vlvl, mx_vlvl, error, after);
++	sweet_gpu_clock_regs("after DCVS");
++	if (error && error != ETIMEDOUT) {
++		/* Firmware refused: request the proven bring-up index again. */
++		int back = a618_gmu_dcvs(&gmu_io, 1);
++		printf("SWEET ADRENO: DCVS restore index 1 errno=%d measured=%u kHz\n",
++		    back, sweet_gpu_measure_khz(core));
++	}
++}
++
++static int
++sweet_gpu_cp_start(vm_offset_t gmu, vm_offset_t smmu)
++{
++ DTEntry node;
++ if (SecureDTLookupEntry(NULL, "/sweet-adreno", &node) != kSuccess) return ENOENT;
++ const unsigned char *sqe = NULL, *mdt = NULL, *code = NULL;
++ unsigned sqe_size = 0, mdt_size = 0, code_size = 0;
++ int error = sweet_gpu_blob(node, "sqe-firmware", "sqe-firmware-crc32", &sqe, &sqe_size);
++ if (!error) error = sweet_gpu_blob(node, "zap-metadata", "zap-metadata-crc32", &mdt, &mdt_size);
++ if (!error) error = sweet_gpu_blob(node, "zap-code", "zap-code-crc32", &code, &code_size);
++ const uint64_t *reserved_base = NULL;
++ const uint32_t *reserved_size = NULL;
++ unsigned length = 0;
++ if (!error && (SecureDTGetProperty(node, "zap-reserved-base", (const void **)&reserved_base,
++     &length) != kSuccess || length != 8 || *reserved_base != 0x97f15000ull)) error = EINVAL;
++ if (!error && (SecureDTGetProperty(node, "zap-reserved-size", (const void **)&reserved_size,
++     &length) != kSuccess || length != 4 || *reserved_size != 0x2000)) error = EINVAL;
++ printf("SWEET ADRENO: CP firmware properties errno=%d SQE=%u MDT=%u ZAP=%u\n",
++     error, sqe_size, mdt_size, code_size);
++ if (error) return error;
++ static struct a618_dma_region memory, metadata;
++ error = sweet_adreno_cp_allocate(&memory);
++ printf("SWEET ADRENO: CP DMA errno=%d PA=%#llx bytes=%u\n", error,
++     memory.physical, memory.bytes);
++ if (error) return error;
++ error = a618_cp_stage(&memory, sqe, sqe_size, sweet_adreno_barrier, NULL);
++ if (error) {
++  printf("SWEET ADRENO: SQE CPU staging/readback errno=%d\n", error);
++  return error;
++ }
++ /* Read the wired allocation through an independent physical IO mapping.
++  * Retain it with the wired storage for the boot lifetime. */
++ vm_offset_t physical_image = ml_io_map(memory.physical + A618_CP_SQE_OFFSET, 0x8000);
++ if (!physical_image) return ENOMEM;
++ volatile uint32_t *staged = (volatile uint32_t *)(memory.cpu + A618_CP_SQE_OFFSET);
++ unsigned verified = 0;
++ for (; verified < (sqe_size - 4) / 4; ++verified) {
++  if (sweet_adreno_read((void *)physical_image, verified * 4) != staged[verified]) {
++   error = EIO; break;
++  }
++ }
++ printf("SWEET ADRENO: SQE physical readback errno=%d words=%u first=%#x,%#x,%#x,%#x\n",
++     error, verified, sweet_adreno_read((void *)physical_image, 0),
++     sweet_adreno_read((void *)physical_image, 4), sweet_adreno_read((void *)physical_image, 8),
++     sweet_adreno_read((void *)physical_image, 12));
++ if (error) return error;
++ const struct a618_smmu_io smmu_io = {
++  {(void *)smmu, sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay},
++  sweet_adreno_read64, sweet_adreno_write64, sweet_adreno_barrier};
++ struct a618_smmu_result map;
++ bzero(&map, sizeof(map));
++ extern int sweet_native_adreno_prepare_vm(const struct a618_smmu_io *,
++     const struct a618_dma_region *, struct a618_smmu_result *);
++ error = sweet_native_adreno_prepare_vm(&smmu_io, &memory, &map);
++ printf("SWEET ADRENO: CP SMMU errno=%d CB=%u slot=%u pages=%u offset=%#x value=%#x PAR=%#llx FSR=%#x\n",
++     error, map.context, map.slot, map.translated, map.offset, map.value, map.par, map.fault);
++ if (error) return error;
++ vm_offset_t core = ml_io_map(0x05000000, 0x40000);
++ if (!core) return ENOMEM;
++ const struct a618_io gpu_io = {(void *)core,
++     sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++ const struct a618_io gmu_io = {(void *)gmu,
++     sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++ error = sweet_adreno_pas_allocate(&metadata);
++ if (error) return error;
++ vm_offset_t zap = ml_io_map(*reserved_base, *reserved_size);
++ if (!zap) return ENOMEM;
++ struct sweet_gpu_zap_request request = {
++  .reserved = (volatile uint32_t *)zap, .physical = *reserved_base,
++  .metadata = &metadata, .mdt = mdt, .code = code,
++  .mdt_bytes = mdt_size, .code_bytes = code_size,
++ };
++ struct a618_cp_result cp;
++ bzero(&cp, sizeof(cp));
++ error = a618_cp_start(&gpu_io, &gmu_io, &memory, sqe, sqe_size,
++     sweet_adreno_barrier, NULL, sweet_gpu_zap_prepare, &request, &cp);
++ printf("SWEET ADRENO: pre-SQE ZAP attempted=%u errno=%d phase=%u status=%lld response=%#llx\n",
++     cp.secure_prepare_attempted, cp.secure_prepare_error, request.result.phase,
++     request.result.status, request.result.response);
++ printf("SWEET ADRENO: CP initial TSB control=%#x base=%#llx size=%#x\n",
++     cp.initial_tsb_control, cp.initial_tsb_base, cp.initial_tsb_size);
++ printf("SWEET ADRENO: CP aperture errno=%d phase=%u status=%lld response=%#llx\n",
++     cp.aperture_error, cp.aperture_phase, cp.aperture_status, cp.aperture_response);
++ printf("SWEET ADRENO: SQE ME_INIT errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x status=%#x IRQ=%#x fault=%#x\n",
++     error, cp.phase, cp.submitted, cp.completed, cp.rptr, cp.wptr, cp.status,
++     cp.interrupt, cp.hw_fault);
++ printf("SWEET ADRENO: CP startup IRQ power=%#x before_auth=%#x after_auth=%#x bootstrap_us=%u CP2GMU=%#x ACTLR=%#x\n",
++     cp.irq_after_power, cp.irq_before_auth, cp.irq_after_auth, cp.bootstrap_wait_us,
++     sweet_adreno_read((void *)core, 0x2048), sweet_adreno_read((void *)smmu, 0x8004));
++ printf("SWEET ADRENO: CP startup initial SQECTL=%#x INSTR=%#x%08x RB_CNTL=%#x snapshots=%u first_fault=%s\n",
++     cp.initial_sqectl, cp.initial_instr_hi, cp.initial_instr_lo,
++     cp.initial_rb_cntl, cp.snapshots, cp.first_fault ? cp.first_fault : "none");
++ for (unsigned i = 0; i < cp.snapshots; ++i)
++  printf("SWEET ADRENO: CP SNAP[%s] IRQ=%#x SQECTL=%#x INSTR=%#x%08x CNTL=%#x CP2GMU=%#x\n",
++      cp.snapshot[i].tag, cp.snapshot[i].irq, cp.snapshot[i].sqectl,
++      cp.snapshot[i].instr_hi, cp.snapshot[i].instr_lo,
++      cp.snapshot[i].rb_cntl, cp.snapshot[i].cp2gmu);
++ printf("SWEET ADRENO: CP execution status local_irq=%#x sqe_started=%u\n", cp.cp_interrupt, cp.sqe_started);
++ printf("SWEET ADRENO: CP MMU CB0FSR=%#x CB1FSR=%#x\n",
++     sweet_adreno_read((void *)smmu, 0x8058), sweet_adreno_read((void *)smmu, 0x9058));
++ /* Snapshot the first hardware fault before any new translation probe or
++  * W1C operation. ATOS success does not prove the CP used the same VA. */
++ printf("SWEET ADRENO: CP fault FAR=%#llx FSYNR0=%#x FSYNR1=%#x SID=%#x TTBR0=%#llx TCR=%#x SCTLR=%#x\n",
++     sweet_adreno_read64((void *)smmu, 0x8060),
++     sweet_adreno_read((void *)smmu, 0x8068), sweet_adreno_read((void *)smmu, 0x806c),
++     sweet_adreno_read((void *)smmu, 0x1400),
++     sweet_adreno_read64((void *)smmu, 0x8020),
++     sweet_adreno_read((void *)smmu, 0x8030), sweet_adreno_read((void *)smmu, 0x8000));
++ printf("SWEET ADRENO: CP addresses SQE=%#llx RING=%#llx SHADOW=%#llx CNTL=%#x SQECTL=%#x\n",
++     ((uint64_t)sweet_adreno_read((void *)core, 0x20c4) << 32) | sweet_adreno_read((void *)core, 0x20c0),
++     ((uint64_t)sweet_adreno_read((void *)core, 0x2004) << 32) | sweet_adreno_read((void *)core, 0x2000),
++     ((uint64_t)sweet_adreno_read((void *)core, 0x2014) << 32) | sweet_adreno_read((void *)core, 0x2010),
++     sweet_adreno_read((void *)core, 0x2008), sweet_adreno_read((void *)core, 0x2020));
++ if (error && (cp.sqe_started || cp.first_fault)) {
++  /* Bounded failure-only indexed SQE state, same 0x33-word bank as A6xx
++   * Linux devcoredump. Each DATA read auto-increments the index. No resume
++   * follows a poisoned CP, so changing this diagnostic selector is harmless. */
++  uint32_t state[51];
++  sweet_adreno_write((void *)core, 0x2420, 0);
++  for (unsigned i = 0; i < 51; ++i)
++   state[i] = sweet_adreno_read((void *)core, 0x2424);
++  for (unsigned i = 0; i < 51; i += 3)
++   printf("SWEET ADRENO: SQE_STAT[%u]=%#x,%#x,%#x\n", i, state[i], state[i + 1], state[i + 2]);
++  printf("SWEET ADRENO: CP hardware RPTR=%#x STATUS1=%#x INTERRUPT=%#x\n",
++      sweet_adreno_read((void *)core, 0x2018), sweet_adreno_read((void *)core, 0x2094),
++      sweet_adreno_read((void *)core, 0x208c));
++  /* Halt the poisoned engine before the bounded instruction-cache capture.
++   * This does not reset it or attempt another submission. Never write a halt
++   * to an engine that did not start: 0106 tests whether that write itself
++   * launches a fetch from the current instruction base. */
++  if (cp.sqe_started) {
++   sweet_adreno_write((void *)core, 0x2020, 3);
++   uint32_t halt = sweet_adreno_read((void *)core, 0x2020);
++   printf("SWEET ADRENO: SQE failure halt=%#x ACTLR=%#x HOST_AP=%#x SQE_AP=%#x\n",
++       halt, sweet_adreno_read((void *)smmu, 0x8004),
++       sweet_adreno_read((void *)core, 0x2800), sweet_adreno_read((void *)core, 0x2804));
++   if (halt != 0xffffffffu && (halt & 3) == 3) {
++    static uint32_t cache[1024];
++    sweet_adreno_write((void *)core, 0x2440, 0);
++    for (unsigned i = 0; i < 1024; ++i)
++     cache[i] = sweet_adreno_read((void *)core, 0x2444);
++    for (unsigned i = 0; i < 1024; i += 8)
++     printf("SWEET ADRENO: SQE_CACHE[%u]=%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x\n",
++         i, cache[i], cache[i + 1], cache[i + 2], cache[i + 3],
++         cache[i + 4], cache[i + 5], cache[i + 6], cache[i + 7]);
++   }
++  } else {
++   printf("SWEET ADRENO: SQE halted=%#x; no pre-start halt write or cache capture\n",
++       sweet_adreno_read((void *)core, 0x2020));
++  }
++ }
++ if (error) return error;
++ error = a618_cp_leave_secure(&gpu_io, &gmu_io, &memory,
++     sweet_adreno_barrier, NULL, &cp);
++ printf("SWEET ADRENO: CP fence errno=%d phase=%u submitted=%u completed=%u RPTR=%#x WPTR=%#x IRQ=%#x fault=%#x fence=%#x value=%#x\n",
++     error, cp.phase, cp.submitted, cp.completed, cp.rptr, cp.wptr, cp.interrupt,
++     cp.hw_fault, cp.fence, cp.value);
++ printf("SWEET ADRENO: CP bootstrap complete errno=%d; iOS rendering ABI unavailable\n", error);
++ if (!error) {
++  sweet_gpu_raise_clock(core, gmu);
++  extern int sweet_native_adreno_adopt(const struct a618_dma_region *, uintptr_t, uintptr_t, uintptr_t, unsigned);
++  error = sweet_native_adreno_adopt(&memory, core, gmu, smmu, cp.fence);
++  printf("SWEET ADRENO: NativeAdreno A618 handoff errno=%d; no userspace rendering\n", error);
++ }
++ return error;
++}
++
++/* Matches postmarketOS SM7150: GMU firmware owns GX power-up. */
++static int
++sweet_gpu_gmu_prepare(int stage)
++{
++	vm_offset_t gcc = ml_io_map(SWEET_GCC_PA, SWEET_GCC_SIZE);
++	if (!gcc)
++		return ENOMEM;
++	const struct a618_io gpucc_io = { (void *)sweet_gpucc,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay };
++	const struct a618_io gcc_io = { (void *)gcc,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay };
++	struct a618_clock_result result;
++	printf("SWEET ADRENO: postmarketOS SM7150 GMU clocks v1 starting\n");
++	int error = a618_enable_gmu_clocks(&gpucc_io, &gcc_io, &result);
++	printf("SWEET ADRENO: GMU clocks errno=%d block=%u offset=%#x value=%#x completed=%u\n",
++	    error, result.block, result.offset, result.value, result.completed);
++	if (error)
++		return error;
++	vm_offset_t gmu = ml_io_map(SWEET_GMU_PA, SWEET_GMU_SIZE);
++	vm_offset_t smmu = ml_io_map(SWEET_SMMU_PA, SWEET_SMMU_SIZE);
++	if (!gmu || !smmu)
++		return ENOMEM;
++	const struct a618_io gmu_io = { (void *)gmu,
++	    sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay };
++	uint32_t reset = sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET);
++	uint32_t power = sweet_adreno_read((void *)gmu, A618_GMU_POWER_STATUS);
++	uint32_t fence = sweet_adreno_read((void *)gmu, A618_GMU_AHB_FENCE_STATUS);
++	printf("SWEET ADRENO: GMU SYSRESET=%#x POWER_STATUS=%#x AHB_FENCE_STATUS=%#x\n",
++	    reset, power, fence);
++	if (reset == 0xffffffffu || power == 0xffffffffu || fence == 0xffffffffu)
++		return EIO;
++	/* ID registers only: do not alter SMMU contexts or stream routing. */
++	uint32_t id0 = sweet_adreno_read((void *)smmu, 0x20);
++	uint32_t id1 = sweet_adreno_read((void *)smmu, 0x24);
++	uint32_t id2 = sweet_adreno_read((void *)smmu, 0x28);
++	printf("SWEET ADRENO: SMMU IDR0=%#x IDR1=%#x IDR2=%#x\n", id0, id1, id2);
++	if (id0 == 0xffffffffu || id1 == 0xffffffffu || id2 == 0xffffffffu || !id0)
++		return EIO;
++	if (stage >= 6) {
++		DTEntry node;
++		const unsigned char *firmware = NULL;
++		const uint32_t *crc = NULL;
++		unsigned int size = 0, crc_size = 0;
++		if (SecureDTLookupEntry(NULL, "/sweet-adreno", &node) != kSuccess ||
++		    SecureDTGetProperty(node, "gmu-firmware", (const void **)&firmware,
++		    &size) != kSuccess ||
++		    SecureDTGetProperty(node, "gmu-crc32", (const void **)&crc,
++		    &crc_size) != kSuccess || crc_size != sizeof(*crc)) {
++			printf("SWEET ADRENO: missing GMU firmware properties; no TCM write\n");
++			return ENOENT;
++		}
++		unsigned verified = 0;
++		error = a618_gmu_stage_legacy(&gmu_io, firmware, size, *crc, &verified);
++		printf("SWEET ADRENO: GMU TCM staging errno=%d verified_bytes=%u; M3 not released\n",
++		    error, verified);
++		if (error)
++			return error;
++	}
++	if (stage >= 7) {
++  (void)sweet_rpmh_arc_probe("xo.lvl");
++  /* Still no M3 release: verify the actual hardware translations first. */
++  if (sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET) != 1 ||
++      !(sweet_gpucc_read(GPU_CC_GX_GDSCR) & GDSC_SW_COLLAPSE) ||
++      !(sweet_gpucc_read(GPU_CC_GX_DOMAIN) & GX_DOMAIN_CLAMP)) {
++   printf("SWEET ADRENO: DMA precondition failed: require M3 reset, GX collapse/clamp\n");
++   return EBUSY;
++  }
++  static struct a618_dma_region memory;
++  static struct a618_hfi hfi;
++  error = sweet_adreno_dma_allocate(&memory);
++  printf("SWEET ADRENO: DMA allocate errno=%d bytes=%u PA=%#llx uncached=%u\n",
++      error, memory.bytes, memory.physical, memory.uncached);
++  if (error) return error;
++  error = a618_hfi_init(&hfi, &memory, sweet_adreno_barrier, NULL);
++  printf("SWEET ADRENO: legacy HFI table errno=%d IOVA=%#x queues=3; firmware not executing\n",
++      error, A618_HFI_IOVA);
++  if (error) return error;
++  const struct a618_smmu_io ops = {
++   { (void *)smmu, sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay },
++   sweet_adreno_read64, sweet_adreno_write64, sweet_adreno_barrier };
++  struct a618_smmu_result result;
++  bzero(&result, sizeof(result));
++  error = a618_smmu_prepare(&ops, &memory, &result);
++  printf("SWEET ADRENO: SMMU map errno=%d CB=%u slot=%u translated=%u offset=%#x value=%#x PAR=%#llx FSR=%#x\n",
++      error, result.context, result.slot, result.translated, result.offset,
++      result.value, result.par, result.fault);
++  printf("SWEET ADRENO: SMMU mapping check complete; SYSRESET=%#x; no firmware execution\n",
++      sweet_adreno_read((void *)gmu, A618_GMU_SYSRESET));
++  if (error) return error;
++  if (stage >= 8) {
++   printf("SWEET ADRENO: GPU context baseline SCTLR0=%#x\n",
++       sweet_adreno_read((void *)smmu, 0x8000));
++   for (unsigned slot = 0; slot < 5; ++slot)
++    printf("SWEET ADRENO: stream slot=%u SMR=%#x S2CR=%#x\n", slot,
++        sweet_adreno_read((void *)smmu, 0x800 + slot * 4),
++        sweet_adreno_read((void *)smmu, 0xc00 + slot * 4));
++   uint32_t gpu_vote = 0, gmu_vote = 0;
++   sweet_gpu_levels_prepare();
++   error = sweet_rpmh_adreno_votes(&gpu_vote, &gmu_vote);
++   printf("SWEET ADRENO: MIN_SVS votes errno=%d GPU=%#x GMU=%#x\n",
++       error, gpu_vote, gmu_vote);
++   if (error) return error;
++   /* PDC apertures from the pinned SM7150 DT, shared by the live A618. */
++   vm_offset_t pdc = ml_io_map(0x0b290000, 0x10000);
++   vm_offset_t seq = ml_io_map(0x0b490000, 0x10000);
++   if (!pdc || !seq) return ENOMEM;
++   const struct a618_io pdc_io = {(void *)pdc,
++       sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++   const struct a618_io seq_io = {(void *)seq,
++       sweet_adreno_read, sweet_adreno_write, sweet_adreno_delay};
++   struct a618_gmu_boot_result boot;
++   bzero(&boot, sizeof(boot));
++   error = a618_gmu_boot_legacy(&gmu_io, &pdc_io, &seq_io, &hfi,
++       gpu_vote, gmu_vote, &boot);
++   printf("SWEET ADRENO: legacy GMU boot errno=%d phase=%u offset=%#x value=%#x FW=%#x; CP unavailable\n",
++       error, boot.phase, boot.offset, boot.value, boot.firmware_version);
++   printf("SWEET ADRENO: HFI request=%#x response=%#x fw_error=%#x packets=%u INFO=%#x HOST_RAW=%#x CB1FSR=%#x\n",
++       hfi.last_request, hfi.last_response, hfi.firmware_error, hfi.responses,
++       sweet_adreno_read((void *)gmu, 0x14648),
++       sweet_adreno_read((void *)gmu, 0x14658),
++       sweet_adreno_read((void *)smmu, 0x9058));
++   sweet_adreno_barrier(NULL);
++   for (unsigned q = 0; q < 3; ++q) {
++    volatile uint32_t *qh = hfi.table + 6 + q * 12;
++    printf("SWEET ADRENO: HFI queue=%u status=%#x dropped=%u RX=%u TX=%u RPTR=%u WPTR=%u\n",
++        q, qh[0], qh[5], qh[8], qh[9], qh[10], qh[11]);
++   }
++   if (!error && stage >= 9) return sweet_gpu_cp_start(gmu, smmu);
++   return error;
++  }
++ }
++	printf("SWEET ADRENO: GMU preparation complete; GX remains firmware controlled, no submission\n");
++	return 0;
++}
++
++static void
++sweet_gpu_arc_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	static int sleep_chan;
++	uint64_t deadline;
++	int stage = sweet_gpu_stage;
++	static const char *const names[] = { "mx.lvl", "cx.lvl", "gfx.lvl" };
++
++	/* Touch normally votes L11C at 45 s. The RPMh API also checks completion. */
++	clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	if (stage >= 4) {
++		printf("SWEET ADRENO: CX controller v2 starting; no GPU core access\n");
++		int error = sweet_gpu_power_cx();
++		printf("SWEET ADRENO: CX controller finished errno=%d; rendering unavailable\n", error);
++		if (!error && stage >= 5) {
++			error = sweet_gpu_gmu_prepare(stage);
++			printf("SWEET ADRENO: GMU stage=%d finished errno=%d; rendering unavailable\n",
++			    stage, error);
++		}
++		goto out;
++	}
++	if (stage == 3) {
++		printf("SWEET GPU: ARC gfx raise v1 starting; mx/cx read-only\n");
++		/* Snapshot the shared rails without writing them. */
++		for (unsigned i = 0; i < 2; ++i) {
++			int error = sweet_rpmh_arc_read(names[i]);
++			if (error) {
++				printf("SWEET GPU: ARC gfx raise stopped at %s errno=%d; no retry\n",
++				    names[i], error);
++				goto out;
++			}
++		}
++		int error = sweet_rpmh_arc_raise("gfx.lvl", SWEET_GPU_GFX_TARGET);
++		if (error) {
++			printf("SWEET GPU: ARC gfx raise v1 stopped errno=%d; no retry\n",
++			    error);
++			goto out;
++		}
++		printf("SWEET GPU: ARC gfx raise v1 complete; GPUCC power/clock writes remain disabled\n");
++		goto out;
++	}
++	printf("SWEET GPU: ARC readback v1 starting; no resource votes\n");
++	for (unsigned i = 0; i < 3; ++i) {
++		int error = sweet_rpmh_arc_read(names[i]);
++		if (error) {
++			printf("SWEET GPU: ARC readback stopped at %s errno=%d; no retry\n",
++			    names[i], error);
++			goto out;
++		}
++	}
++	printf("SWEET GPU: ARC readback v1 complete; power/clock writes remain disabled\n");
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_gpu_probe(void)
++{
++	int enabled = 0;
++	uint32_t cx, cx_hw, gx, domain, reset;
++	unsigned int i;
++
++	if (sweet_gpu_probe_attempted) {
++		return;
++	}
++	sweet_gpu_probe_attempted = 1;
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (enabled < 1 || enabled > 9) {
++		printf("SWEET GPU: audit disabled; sweetgpu=1 read-only, 2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup, 9 SQE/CP commands\n");
++		return;
++	}
++
++	printf("SWEET GPU: GPUCC audit v2 at %#x; stage=%d; GMU access requires clock checks\n",
++	    SWEET_GPUCC_PA, enabled);
++	sweet_gpucc = ml_io_map(SWEET_GPUCC_PA, SWEET_GPUCC_SIZE);
++	if (sweet_gpucc == 0) {
++		printf("SWEET GPU: GPUCC mapping failed\n");
++		return;
++	}
++
++	/*
++	 * CX uses the separate HW-control status register in the live DT.
++	 * Preserve raw GX status: the DT also has qcom,poll-cfg-gdscr, whose
++	 * semantics differ across downstream kernels. These snapshots are not
++	 * permission to touch the core, even if a power/clock bit is set.
++	 */
++	cx = sweet_gpucc_read(GPU_CC_CX_GDSCR);
++	cx_hw = sweet_gpucc_read(GPU_CC_CX_HW_CTRL);
++	gx = sweet_gpucc_read(GPU_CC_GX_GDSCR);
++	domain = sweet_gpucc_read(GPU_CC_GX_DOMAIN);
++	reset = sweet_gpucc_read(GPU_CC_GX_BCR);
++	printf("SWEET GPU: CX_GDSCR=%#x CX_HW_CTRL=%#x GX_GDSCR=%#x GX_DOMAIN=%#x GX_BCR=%#x\n",
++	    cx, cx_hw, gx, domain, reset);
++	printf("SWEET GPU: CX pwr_on=%u collapse=%u hw_control=%u; GX bit31=%u collapse=%u hw_control=%u clamp=%u gmem_reset=%u block_reset=%u\n",
++	    !!(cx_hw & GDSC_PWR_ON), !!(cx & GDSC_SW_COLLAPSE),
++	    !!(cx & GDSC_HW_CONTROL), !!(gx & GDSC_PWR_ON),
++	    !!(gx & GDSC_SW_COLLAPSE), !!(gx & GDSC_HW_CONTROL),
++	    !!(domain & 1u), !!(domain & (1u << 4)), !!(reset & 1u));
++
++	for (i = 0; i < sizeof(sweet_gpu_branches) / sizeof(sweet_gpu_branches[0]); i++) {
++		uint32_t value = sweet_gpucc_read(sweet_gpu_branches[i].offset);
++		printf("SWEET GPU: CBCR %s @%#x=%#x enable=%u clk_off=%u fsm=%u\n",
++		    sweet_gpu_branches[i].name, sweet_gpu_branches[i].offset,
++		    value, !!(value & BRANCH_CLK_ENABLE),
++		    !!(value & BRANCH_CLK_OFF), (value >> 28) & 7u);
++	}
++	if (sweet_gpu_arc_tables()) {
++		printf("SWEET GPU: ARC stage stopped; no GPUCC power/clock/reset writes\n");
++		return;
++	}
++	if (enabled == 1) {
++		printf("SWEET GPU: read-only audit complete; sweetgpu=2 reads ARC resources, 3 raises gfx.lvl, 4 powers CX, 5 GMU clocks/status, 6 firmware staging, 7 DMA/SMMU/HFI mappings, 8 legacy GMU/HFI startup, 9 SQE/CP commands\n");
++		return;
++	}
++	sweet_gpu_stage = enabled;
++	thread_t thread;
++	kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		if (enabled >= 5) {
++			printf("SWEET ADRENO: GMU stage=%d scheduled in 60 s; CX and clock gates first\n", enabled);
++		} else if (enabled == 4) {
++			printf("SWEET ADRENO: CX controller v2 scheduled in 60 s; fresh rail checks required\n");
++		} else if (enabled == 3) {
++			printf("SWEET GPU: ARC gfx raise v1 scheduled in 60 s; gfx only\n");
++		} else {
++			printf("SWEET GPU: ARC readback v1 scheduled in 60 s; no resource votes\n");
++		}
++	} else {
++		printf("SWEET GPU: ARC worker thread failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index b3a1328..05b0964 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1,12 +1,9 @@
+ /*
+  * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+- * 0095: active, sleep and wake-set votes. DT tcs-config puts them at
+- * TCS 0..1 / 2..4 / 5..7 of this DRV; 0094 proved sleep votes physically
+- * act while active votes acked but changed nothing, and Linux
+- * (rpmh-regulator.c) sends active values to the WAKE_ONLY state first
+- * whenever the sleep set differs. No SPMI writes, GIC handler or
+- * timeout recovery.
++ * Joyeuse also programs the SLEEP/WAKE TCS banks for touch rails; the ARC
++ * reads/writes below keep the donor GPU power votes. No SPMI writes, GIC
++ * handler, or timeout recovery.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -17,8 +14,22 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_vreg_sleep(const char *res, unsigned mv);
++int sweet_rpmh_vreg_wake(const char *res, unsigned mv);
+ int sweet_rpmh_vreg_off(const char *res);
+ void sweet_rpmh_db_dump(void);
++int sweet_rpmh_arc_probe(const char *res);
++int sweet_rpmh_arc_read(const char *res);
++int sweet_rpmh_arc_require(const char *res, unsigned minimum);
++int sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl);
++
++/* Resource descriptor resolved from the bootloader command DB. */
++struct rh_res {
++	uint32_t addr;
++	uint32_t aux;
++	uint16_t aux_len;
++	unsigned slave;
++};
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -37,6 +48,13 @@ void sweet_rpmh_db_dump(void);
+ #define RH_IRQ_EN       0x00u
+ #define RH_IRQ_STATUS   0x04u
+ #define RH_IRQ_CLEAR    0x08u
++/* Saved sweet live FDT: apps_rsc interrupts=<0 5 0>, GICv3 at
++ * 0x17a00000. SPI5 is GIC INTID37. RSC completion latching and GIC
++ * delivery are separate gates: keep delivery disabled while polling. */
++#define RH_GICD_PA      0x17a00000u
++#define RH_GIC_INTID    37u
++#define RH_GIC_ISENABLER 0x100u
++#define RH_GIC_ISACTIVER 0x300u
+ #define RH_WAIT         0x10u
+ #define RH_CONTROL      0x14u
+ #define RH_STATUS       0x18u
+@@ -45,18 +63,23 @@ void sweet_rpmh_db_dump(void);
+ #define RH_ADDR         0x34u
+ #define RH_DATA         0x38u
+ #define RH_CMD_STATUS   0x3cu
+-#define RH_RESP         0x40u
++#define RH_RESP_DATA    0x40u
+ #define RH_AMC_EN       (1u << 16)
+ #define RH_TRIGGER      (1u << 24)
+ #define RH_ISSUED       (1u << 8)
+ #define RH_COMPLETE     (1u << 16)
+-#define RH_WRITE_ACK    (8u | (1u << 8) | (1u << 16))
++#define RH_READ_ACK     (8u | (1u << 8))
++#define RH_WRITE_ACK    (RH_READ_ACK | (1u << 16))
+ #define RH_DB_MAGIC     0x0c0330dbu
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
++#define RH_ARC_LEVEL_SIZE   2u
++#define RH_ARC_MAX_LEVELS   16u
+ #define RH_TIMEOUT_US   100000u
++#define RH_ARC_TIMEOUT_US 200000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+ static uint32_t rh_db_size;
+@@ -171,7 +194,7 @@ rh_map(void)
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned expected_slave, struct rh_res *out)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -185,10 +208,10 @@ rh_lookup(const char *res, uint32_t *address)
+ 			break;
+ 		}
+ 		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+-		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		uint32_t data = RH_DB_HEADER + rh_db16(h + 4);
+ 		unsigned count = rh_db16(h + 6);
+ 		if (slave < 3 || slave > 5 || (entries & 3u) ||
+-		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(data, 0)) {
+ 			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
+ 			return EINVAL;
+ 		}
+@@ -198,15 +221,32 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+-			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++			uint32_t aux_len = rh_db16(e + 20);
++			uint32_t aux_off = rh_db16(e + 22);
++			uint32_t align = expected_slave == RH_ARC ? 3u : 15u;
++			if (slave != expected_slave || (addr >> 16) != expected_slave ||
++			    (addr & align) || aux_off > rh_db_size - data ||
++			    !rh_range(data + aux_off, aux_len)) {
++				printf("SWEET RPMH: invalid slave %u entry for %s\n",
++				    expected_slave, res);
++				return EINVAL;
++			}
++			if (expected_slave == RH_ARC &&
++			    ((data + aux_off) & 1u || rh_db16(h + 8) != 0x1000u ||
++			    aux_len < RH_ARC_LEVEL_SIZE ||
++			    aux_len > RH_ARC_MAX_LEVELS * RH_ARC_LEVEL_SIZE ||
++			    (aux_len & (RH_ARC_LEVEL_SIZE - 1u)))) {
++				printf("SWEET RPMH: invalid ARC aux length %u for %s\n",
++				    aux_len, res);
+ 				return EINVAL;
+ 			}
+-			*address = addr;
++			out->addr = addr;
++			out->aux = data + aux_off;
++			out->aux_len = (uint16_t)aux_len;
++			out->slave = slave;
+ 			++matches;
+-			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+-			    res, addr, slave, rh_db16(h + 8),
++			printf("SWEET RPMH: %s addr=%#x slave=%u aux=%u@%#x version=%#x priority=%#x:%#x\n",
++			    res, addr, slave, aux_len, data + aux_off, rh_db16(h + 8),
+ 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+ 		}
+ 	}
+@@ -217,6 +257,44 @@ rh_lookup(const char *res, uint32_t *address)
+ 	return 0;
+ }
+ 
++/*
++ * Decode an ARC level table.  Command-DB aux data is a little-endian u16
++ * array of resource-specific levels; the consumer level adds one because
++ * zero is an invalid voltage.  Zero padding after the first entry is
++ * ignored, matching the downstream regulator driver.
++ */
++static int
++rh_arc_levels(const struct rh_res *res, uint32_t *level, unsigned *count)
++{
++	unsigned n = res->aux_len / RH_ARC_LEVEL_SIZE;
++	if (n == 0 || n > RH_ARC_MAX_LEVELS) {
++		return EINVAL;
++	}
++	unsigned used = n;
++	for (unsigned i = 0; i < n; ++i) {
++		uint16_t value = rh_db16(res->aux + i * RH_ARC_LEVEL_SIZE);
++		if (i > 0 && value == 0) {
++			used = i;
++			for (unsigned j = i + 1; j < n; ++j) {
++				if (rh_db16(res->aux + j * RH_ARC_LEVEL_SIZE)) {
++					return EINVAL; /* nonzero data after padding */
++				}
++			}
++			break;
++		}
++		level[i] = value + 1;
++		if (i > 0 && level[i] < level[i - 1]) {
++			printf("SWEET RPMH: non-monotonic ARC table index=%u\n", i);
++			return EINVAL;
++		}
++	}
++	if (used == 0 || level[used - 1] == 0) {
++		return EINVAL;
++	}
++	*count = used;
++	return 0;
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -230,36 +308,65 @@ rh_free(unsigned t)
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
+-/* Pick a free TCS in [lo, lo+n) with no conflicting inherited payload. */
++/* No GIC writes: this polled controller has no registered IRQ handler.
++ * Refuse ownership if another user has enabled or activated its SPI. */
++static bool
++rh_poll_delivery_disabled(void)
++{
++	static vm_offset_t gicd;
++	if (!gicd) {
++		gicd = ml_io_map(RH_GICD_PA, 0x1000);
++	}
++	if (!gicd) {
++		return false;
++	}
++	const uint32_t reg = (RH_GIC_INTID / 32u) * 4u;
++	const uint32_t bit = 1u << (RH_GIC_INTID % 32u);
++	uint32_t enabled = rh_read(gicd, RH_GIC_ISENABLER + reg);
++	uint32_t active = rh_read(gicd, RH_GIC_ISACTIVER + reg);
++	printf("SWEET RPMH: poll completion v2 GIC INTID%u enable=%#x active=%#x\n",
++	    RH_GIC_INTID, enabled, active);
++	return enabled != 0xffffffffu && active != 0xffffffffu &&
++	    !(enabled & bit) && !(active & bit);
++}
++
++static bool rh_arc_name(const char *res);
++
++static void
++rh_quarantine_source(uint32_t bit)
++{
++	/* Never acknowledge, reset or retry an uncertain transaction. Mask only
++	 * our source; retain the poisoned state and all command storage. */
++	(void)rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit);
++}
++
+ static int
+-rh_select(const char *bank, unsigned lo, unsigned n, uint32_t address, int *out)
++rh_send_cmds(const char *res, unsigned first, unsigned ntcs, const char *bank,
++    uint32_t address, uint32_t align_mask,
++    const uint32_t *offsets, const uint32_t *values, unsigned n,
++    unsigned timeout_us, uint32_t *response)
+ {
++	if (n == 0 || n > rh_ncpt || n > RH_ARC_MAX_LEVELS ||
++	    (response && n != 1) || ntcs == 0 || first + ntcs > RH_NORMAL_N) {
++		return EINVAL;
++	}
+ 	int chosen = -1;
+-	for (unsigned i = 0; i < n; ++i) {
+-		unsigned t = lo + i;
++	for (unsigned i = 0; i < ntcs; ++i) {
++		unsigned t = first + i;
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+ 		printf("SWEET RPMH: %s TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
+ 		    bank, t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
+ 		    enabled, rh_read(rh_tcs, b + RH_WAIT));
+-		if (enabled) {
+-			for (unsigned c = 0; c < rh_ncpt; ++c) {
+-				if (enabled & (1u << c)) {
+-					printf("SWEET RPMH: %s TCS%u slot%u addr=%#x data=%#x\n",
+-					    bank, t, c,
+-					    rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE),
+-					    rh_read(rh_tcs, b + RH_DATA + c * RH_CMD_STRIDE));
+-				}
+-			}
+-		}
+ 		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+ 			return EIO;
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in %s TCS%u\n",
+-				    bank, t);
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) &
++			    ~align_mask) == address) {
++				printf("SWEET RPMH: conflicting inherited %s request in TCS%u\n",
++				    res, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -271,17 +378,15 @@ rh_select(const char *bank, unsigned lo, unsigned n, uint32_t address, int *out)
+ 		printf("SWEET RPMH: no empty idle %s TCS; leaving inherited state intact\n", bank);
+ 		return EBUSY;
+ 	}
+-	*out = chosen;
+-	return 0;
+-}
+-
+-/* Arm the three VRM commands in TCS slot t, trigger, wait for completion. */
+-static int
+-rh_fire(unsigned t, const char *bank, uint32_t address, unsigned mv, unsigned en)
+-{
++	unsigned t = (unsigned)chosen;
+ 	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t enable = (1u << n) - 1u;
+ 	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
+-	if (irq_en == 0xffffffffu || !rh_free(t)) {
++	/* ARC needs the fresh completion latch; the touch/VRM rails keep the
++	 * joyeuse progress fallback (their sleep/wake banks do not raise the
++	 * ACTIVE source in every boot). */
++	const bool poll_latch = rh_arc_name(res);
++	if (irq_en == 0xffffffffu || !rh_free(t) || (poll_latch && !rh_poll_delivery_disabled())) {
+ 		return EBUSY;
+ 	}
+ 	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
+@@ -298,56 +403,72 @@ rh_fire(unsigned t, const char *bank, uint32_t address, unsigned mv, unsigned en
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, en};
+-	printf("SWEET RPMH: %s TCS%u %u mV mode=7 enable=%u irq-enable=%#x\n",
+-	    bank, t, mv, en, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u %s %s %s commands=%u irq-enable=%#x\n",
++	    t, bank, response ? "READ" : "WRITE", res, n, irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+-		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++		if (!rh_sync(cmd + RH_MSGID, response ? RH_READ_ACK : RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, values[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, enable) || !rh_sync(b + RH_ENABLE, enable) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
++	/* Linux keeps ACTIVE TCS completion sources enabled. Masking this
++	 * source made IRQ_STATUS stay zero and left only a transient busy edge
++	 * as completion evidence. Clear only our known-free latch, enable it,
++	 * and require it to start clear. GIC delivery stays disabled throughout. */
++	if (poll_latch) {
++		rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
++		if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++		    !rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) | bit) ||
++		    (rh_read(rh_tcs, RH_IRQ_STATUS) & bit)) {
++			rh_quarantine_source(bit);
++			return EIO;
++		}
++	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	uint32_t irq = 0, idle = 0, status[RH_ARC_MAX_LEVELS] = {0};
+ 	bool done = false, progress = false;
+-	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++	for (unsigned us = 0; us < timeout_us; ++us) {
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+ 		}
+-		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
+ 		progress |= idle == 0 || !complete;
++		/* ARC requires the fresh latch. Preserve the existing touchscreen
++		 * regulator path; it is not part of this GPU completion change.
++		 * Old command status and an idle TCS alone are never accepted. */
+ 		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
+-		    ((irq & bit) || progress) && complete) {
++		    ((irq & bit) || (!poll_latch && progress)) && complete) {
+ 			done = true;
+ 			break;
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: %s TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x"
+-	    " resp=%#x/%#x/%#x\n",
+-	    bank, t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2],
+-	    rh_read(rh_tcs, b + RH_RESP + 0 * RH_CMD_STRIDE),
+-	    rh_read(rh_tcs, b + RH_RESP + 1 * RH_CMD_STRIDE),
+-	    rh_read(rh_tcs, b + RH_RESP + 2 * RH_CMD_STRIDE));
++	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x",
++	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL));
++	for (unsigned c = 0; c < n; ++c) {
++		printf(" status%u=%#x", c, status[c]);
++	}
++	printf("\n");
+ 	if (!done) {
++		rh_quarantine_source(bit);
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+ 	}
++	/* Read payload before releasing the slot; do not expose it on cleanup error. */
++	uint32_t reply = response ? rh_read(rh_tcs, b + RH_RESP_DATA) : 0;
+ 	/* Proven completion: clear trigger before mode, then free only our commands. */
+-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	if (!rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit) ||
++	    !rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
+ 	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+ 		return EIO;
+ 	}
+@@ -357,23 +478,16 @@ rh_fire(unsigned t, const char *bank, uint32_t address, unsigned mv, unsigned en
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: %s TCS%u vote complete (rail voltage requires hardware verification)\n",
+-	    bank, t);
+-	return 0;
+-}
+-
+-static int
+-rh_send(uint32_t address, unsigned mv, unsigned en)
+-{
+-	int chosen = 0;
+-	int error = rh_select("ACTIVE", 0, RH_ACTIVE_N, address, &chosen);
+-	if (!error) {
+-		error = rh_fire((unsigned)chosen, "ACTIVE", address, mv, en);
++	if (response) {
++		*response = reply;
++		printf("SWEET RPMH: %s %s read complete raw=%#x\n", res, bank, reply);
++	} else {
++		printf("SWEET RPMH: %s %s vote complete\n", res, bank);
+ 	}
+-	return error;
++	return 0;
+ }
+ 
+-/* Whitelist + DT voltage range check shared by the active and sleep votes. */
++/* Whitelist + DT voltage range check shared by every rail vote. */
+ static int
+ rh_vote_check(const char *res, unsigned mv)
+ {
+@@ -390,13 +504,10 @@ rh_vote_check(const char *res, unsigned mv)
+ 	return 0;
+ }
+ 
+-int
+-sweet_rpmh_vreg_enable(const char *res, unsigned mv)
++static int
++rh_vreg_vote(const char *res, unsigned mv, unsigned en, unsigned first,
++    unsigned ntcs, const char *bank)
+ {
+-	/*
+-	 * Board-specific helper: only the known touch rails, each with its
+-	 * DT voltage range (sweet ldoc11; miatoll ldoa10/ldoc7).
+-	 */
+ 	int check = rh_vote_check(res, mv);
+ 	if (check) {
+ 		return check;
+@@ -405,177 +516,415 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 		return EBUSY;
+ 	}
+ 	int error = EIO;
+-	uint32_t address = 0;
++	struct rh_res found = {0};
+ 	if (rh_poisoned) {
+ 		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
+ 		goto out;
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &found);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv, 1);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t offsets[3] = {0, 8, 4};
++		const uint32_t values[3] = {mv, 7, en};
++		error = rh_send_cmds(res, first, ntcs, bank, found.addr, 15u,
++		    offsets, values, 3, RH_TIMEOUT_US, NULL);
+ 	}
+ out:
+ 	if (error) {
+-		printf("SWEET RPMH: enable failed errno=%d\n", error);
++		printf("SWEET RPMH: %s vote failed errno=%d\n", bank, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
+ 
+-/*
+- * 0094: mirror the vote into the SLEEP set (TCS 2..4 of this DRV). Linux's
+- * qcom,set=0x03 sends both sets; 0093's active-only votes acked but never
+- * changed any readable PMIC register, so the missing sleep set is the
+- * prime suspect for votes that never physically act.
+- */
++int
++sweet_rpmh_vreg_enable(const char *res, unsigned mv)
++{
++	return rh_vreg_vote(res, mv, 1, 0, RH_ACTIVE_N, "ACTIVE");
++}
++
++/* Joyeuse 0094: mirror the vote into the SLEEP set (TCS 2..4). */
+ int
+ sweet_rpmh_vreg_sleep(const char *res, unsigned mv)
+ {
+-	int check = rh_vote_check(res, mv);
+-	if (check) {
+-		return check;
++	return rh_vreg_vote(res, mv, 1, RH_SLEEP_FIRST, RH_SLEEP_N, "SLEEP");
++}
++
++/* Joyeuse 0095: mirror the vote into the WAKE set (TCS 5..7). */
++int
++sweet_rpmh_vreg_wake(const char *res, unsigned mv)
++{
++	return rh_vreg_vote(res, mv, 1, RH_WAKE_FIRST, RH_WAKE_N, "WAKE");
++}
++
++int
++sweet_rpmh_vreg_off(const char *res)
++{
++	/* Same whitelist and nominal voltage; only the enable vote flips. */
++	unsigned mv = strcmp(res, "ldoc11") == 0 ? 3200u
++	    : strcmp(res, "ldoa10") == 0 ? 1800u
++	    : strcmp(res, "ldoc7") == 0 ? 3000u
++	    : strcmp(res, "ldoc2") == 0 ? 1200u : 0u;
++	if (!mv) {
++		printf("SWEET RPMH: off: unknown resource\n");
++		return EINVAL;
+ 	}
++	return rh_vreg_vote(res, mv, 0, 0, RH_ACTIVE_N, "ACTIVE");
++}
++
++/* One line per cmd-db resource: name, vote address, slave. */
++void
++sweet_rpmh_db_dump(void)
++{
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+-		return EBUSY;
++		return;
+ 	}
+-	int error = EIO;
+-	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++	if (rh_map()) {
+ 		goto out;
+ 	}
+-	error = rh_map();
+-	if (!error) {
+-		error = rh_lookup(res, &address);
+-	}
+-	if (!error) {
+-		int chosen = 0;
+-		error = rh_select("SLEEP", RH_SLEEP_FIRST, RH_SLEEP_N, address, &chosen);
+-		if (!error) {
+-			error = rh_fire((unsigned)chosen, "SLEEP", address, mv, 1);
++	for (unsigned i = 0; ; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
++			break;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			char name[9] = {0};
++			for (unsigned k = 0; k < 8; ++k) {
++				name[k] = (char)(rh_read(rh_db, e + 4u * (k / 4)) >>
++				    (8u * (k % 4)) & 0xffu);
++			}
++			printf("SWEET RPMH: db %s addr=%#x slave=%u\n",
++			    name, rh_read(rh_db, e + 16), slave);
+ 		}
+ 	}
+ out:
+-	if (error) {
+-		printf("SWEET RPMH: sleep vote failed errno=%d\n", error);
+-	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+-	return error;
++}
++
++static bool
++rh_arc_name(const char *res)
++{
++	return res && (!strcmp(res, "cx.lvl") || !strcmp(res, "mx.lvl") ||
++	    !strcmp(res, "gfx.lvl"));
+ }
+ 
+ /*
+- * 0095: mirror the vote into the WAKE set (TCS 5..7 of this DRV). The wake
+- * set is what RPMh applies while the system is awake; rpmh-regulator.c
+- * sends active values there before the active-only state whenever the
+- * sleep set differs, and 0094 showed active-only votes alone never act.
++ * Read-only command-DB inspection.  No TCS is claimed, no RPMH command is
++ * written, and no rail is changed.  This is the evidence-gathering step before
++ * the first ARC vote.
+  */
+ int
+-sweet_rpmh_vreg_wake(const char *res, unsigned mv)
++sweet_rpmh_arc_probe(const char *res)
+ {
+-	int check = rh_vote_check(res, mv);
+-	if (check) {
+-		return check;
++	/* XO inspection only: write APIs retain the original resource whitelist. */
++	if (!rh_arc_name(res) && (!res || strcmp(res, "xo.lvl"))) {
++		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		return EBUSY;
+ 	}
+ 	int error = EIO;
+-	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
+-		goto out;
+-	}
++	struct rh_res found = {0};
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_ARC, &found);
+ 	}
+ 	if (!error) {
+-		int chosen = 0;
+-		error = rh_select("WAKE", RH_WAKE_FIRST, RH_WAKE_N, address, &chosen);
++		uint32_t level[RH_ARC_MAX_LEVELS] = {0};
++		unsigned count = 0;
++		error = rh_arc_levels(&found, level, &count);
+ 		if (!error) {
+-			error = rh_fire((unsigned)chosen, "WAKE", address, mv, 1);
++			printf("SWEET RPMH: ARC %s read-only table:", res);
++			for (unsigned i = 0; i < count; ++i) {
++				printf(" %u:%u", i, level[i]);
++			}
++			printf("\n");
+ 		}
+ 	}
+-out:
+ 	if (error) {
+-		printf("SWEET RPMH: wake vote failed errno=%d\n", error);
++		printf("SWEET RPMH: ARC probe %s failed errno=%d\n", res, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
+ 
++/* Build wire votes from raw command-DB levels, not regulator levels (+1).
++ * Uses only command-DB RAM: no new ACTIVE TCS write authority. */
++int sweet_rpmh_adreno_votes(uint32_t *gpu, uint32_t *gmu);
+ int
+-sweet_rpmh_vreg_off(const char *res)
++sweet_rpmh_adreno_votes(uint32_t *gpu, uint32_t *gmu)
+ {
+-	/* Same whitelist and nominal voltage; only the enable vote flips. */
+-	unsigned mv = strcmp(res, "ldoc11") == 0 ? 3200u
+-	    : strcmp(res, "ldoa10") == 0 ? 1800u
+-	    : strcmp(res, "ldoc7") == 0 ? 3000u
+-	    : strcmp(res, "ldoc2") == 0 ? 1200u : 0u;
+-	if (!mv) {
+-		printf("SWEET RPMH: off: unknown resource\n");
++ if (!gpu || !gmu) return EINVAL;
++ *gpu = *gmu = 0;
++ if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++ const char *names[] = {"gfx.lvl", "cx.lvl", "mx.lvl"};
++ const uint32_t address[] = {0x30050, 0x30000, 0x30010};
++ uint32_t levels[3][RH_ARC_MAX_LEVELS] = {{0}};
++ unsigned counts[3] = {0}, selected[3] = {0};
++ int error = rh_map();
++ for (unsigned r = 0; !error && r < 3; ++r) {
++  struct rh_res resource = {0};
++  error = rh_lookup(names[r], RH_ARC, &resource);
++  if (!error && resource.addr != address[r]) error = ENODEV;
++  if (!error) error = rh_arc_levels(&resource, levels[r], &counts[r]);
++  if (error) break;
++  /* MIN_SVS is raw 48 in the pinned RPMh bindings. The measured
++  * GFX/CX tables round this up to 64; MX rounds up to 192. */
++  unsigned i;
++  for (i = 0; i < counts[r]; ++i) {
++   --levels[r][i];
++   if (!selected[r] && levels[r][i] >= 48) selected[r] = i;
++  }
++  if (!selected[r] || levels[r][0] != 0) error = ERANGE;
++ }
++ if (!error) {
++  *gpu = (levels[0][selected[0]] << 16) | (selected[2] << 8) | selected[0];
++  *gmu = (levels[1][selected[1]] << 16) | (selected[2] << 8) | selected[1];
++ }
++ __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++ return error;
++}
++
++/*
++ * One GPU performance level's wire vote, as Linux a6xx_gmu_rpmh_arc_votes_init:
++ * the first gfx.lvl entry at or above the OPP's raw level is primary; the
++ * first mx.lvl entry at or above it is secondary, else the highest nonzero
++ * one. *mx_level returns that secondary level for an APPS raise-only floor.
++ */
++int sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level);
++int
++sweet_rpmh_adreno_level_vote(unsigned level, uint32_t *vote, unsigned *mx_level)
++{
++ if (!vote || !mx_level || !level) return EINVAL;
++ *vote = 0; *mx_level = 0;
++ if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++ const char *names[] = {"gfx.lvl", "mx.lvl"};
++ const uint32_t address[] = {0x30050, 0x30010};
++ uint32_t levels[2][RH_ARC_MAX_LEVELS] = {{0}};
++ unsigned counts[2] = {0}, index[2] = {0};
++ bool found[2] = {false, false};
++ int error = rh_map();
++ for (unsigned r = 0; !error && r < 2; ++r) {
++  struct rh_res resource = {0};
++  error = rh_lookup(names[r], RH_ARC, &resource);
++  if (!error && resource.addr != address[r]) error = ENODEV;
++  if (!error) error = rh_arc_levels(&resource, levels[r], &counts[r]);
++  if (error) break;
++  for (unsigned i = 0; i < counts[r]; ++i) {
++   --levels[r][i];
++   if (!found[r] && levels[r][i] >= level) { index[r] = i; found[r] = true; }
++   else if (!found[r] && r == 1 && levels[r][i]) index[r] = i;
++  }
++  if (levels[r][0] != 0) error = ERANGE;
++ }
++ if (!error && !found[0]) error = ERANGE;
++ if (!error && !index[1]) error = ERANGE;
++ if (!error) {
++  *vote = (levels[0][index[0]] << 16) | (index[1] << 8) | index[0];
++  *mx_level = levels[1][index[1]];
++ }
++ __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++ return error;
++}
++
++/*
++ * Read one ARC resource while the caller holds rh_lock. The same serialized
++ * ACTIVE TCS engine is used for reads and for the raise-only write below.
++ */
++static int
++rh_arc_read_locked(const char *res, struct rh_res *found,
++    uint32_t *level, unsigned *count, uint32_t *reply)
++{
++	int error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_ARC, found);
++	}
++	if (!error) {
++		error = rh_arc_levels(found, level, count);
++	}
++	if (!error) {
++		const uint32_t zero = 0;
++		error = rh_send_cmds(res, 0, RH_ACTIVE_N, "ACTIVE", found->addr, 3u, &zero, &zero, 1,
++		    RH_ARC_TIMEOUT_US, reply);
++	}
++	return error;
++}
++
++/*
++ * ARC READ uses the same serialized ACTIVE TCS engine as the touch VRM.
++ * qcom-rpmh-mailbox.c defines READ by clearing MSGID.WRITE and retrieves
++ * CMD_RESP_DATA at 0x40. This does not change a resource vote, although it
++ * programs a TCS. Do not infer the retained APPS vote from the DT minimum.
++ *
++ * The meaning of an ARC reply must be established on this board before
++ * introducing a vote floor. Until then this API logs raw replies only.
++ */
++int
++sweet_rpmh_arc_read(const char *res)
++{
++	if (!rh_arc_name(res)) {
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		return EBUSY;
+ 	}
+ 	int error = EIO;
+-	uint32_t address = 0;
++	struct rh_res found = {0};
++	uint32_t level[RH_ARC_MAX_LEVELS] = {0};
++	unsigned count = 0;
++	uint32_t reply = 0xffffffffu;
+ 	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		printf("SWEET RPMH: previous uncertain transaction; refusing ARC read\n");
+ 		goto out;
+ 	}
+-	error = rh_map();
+-	if (!error) {
+-		error = rh_lookup(res, &address);
+-	}
++	error = rh_arc_read_locked(res, &found, level, &count, &reply);
+ 	if (!error) {
+-		error = rh_send(address, mv, 0);
++		printf("SWEET RPMH: ARC %s reply=%#x table-count=%u\n",
++		    res, reply, count);
++		if (reply < count) {
++			printf("SWEET RPMH: ARC reply as index: vlvl=%u (interpretation unverified)\n",
++			    level[reply]);
++		} else {
++			printf("SWEET RPMH: ARC reply is not a plain table index\n");
++		}
+ 	}
+ out:
+ 	if (error) {
+-		printf("SWEET RPMH: off failed errno=%d\n", error);
++		printf("SWEET RPMH: ARC read %s failed errno=%d\n", res, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
+ 
+-/* One line per cmd-db resource: name, vote address, slave. */
+-void
+-sweet_rpmh_db_dump(void)
++/* Check the current board's ARC selector interpretation without voting.
++ * Unlike arc_read(), this returns an error for off/out-of-range replies.
++ * This is a resource-setting check; it does not measure a rail voltage.
++ */
++int
++sweet_rpmh_arc_require(const char *res, unsigned minimum)
+ {
++	if (!rh_arc_name(res) || minimum <= 1)
++		return EINVAL;
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE))
++		return EBUSY;
++	int error = EIO;
++	struct rh_res found = {0};
++	uint32_t levels[RH_ARC_MAX_LEVELS] = {0}, reply = 0xffffffffu;
++	unsigned count = 0;
++	if (rh_poisoned)
++		goto out;
++	error = rh_arc_read_locked(res, &found, levels, &count, &reply);
++	if (error)
++		goto out;
++	if (reply >= count) {
++		error = EIO;
++		goto out;
++	}
++	printf("SWEET RPMH: ARC require %s selector=%u interpreted-level=%u minimum=%u\n",
++	    res, reply, levels[reply], minimum);
++	if (levels[reply] < minimum)
++		error = EAGAIN;
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/*
++ * Raise-only ARC vote. This is deliberately narrower than 0083's fixed
++ * votes: it reads the resource first, refuses a non-index reply, and never
++ * writes a selector below the current level. gfx.lvl and mx.lvl only: a
++ * GPU clock above the bootloader corner first raises both APPS floors so the
++ * rails cannot depend solely on the GMU's own votes. cx.lvl stays untouched.
++ */
++int
++sweet_rpmh_arc_raise(const char *res, unsigned target_vlvl)
++{
++	if (!res || (strcmp(res, "gfx.lvl") && strcmp(res, "mx.lvl")) || target_vlvl == 0) {
++		return EINVAL;
++	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+-		return;
++		return EBUSY;
+ 	}
+-	if (rh_map()) {
++	int error = EIO;
++	struct rh_res found = {0};
++	uint32_t level[RH_ARC_MAX_LEVELS] = {0};
++	unsigned count = 0;
++	uint32_t before = 0xffffffffu, after = 0xffffffffu;
++	unsigned selector = 0;
++
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing ARC raise\n");
+ 		goto out;
+ 	}
+-	for (unsigned i = 0; ; ++i) {
+-		uint32_t h = 8u + 16u * i;
+-		unsigned slave = rh_db16(h);
+-		if (!slave) {
+-			break;
+-		}
+-		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+-		unsigned count = rh_db16(h + 6);
+-		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
++	error = rh_arc_read_locked(res, &found, level, &count, &before);
++	if (error) {
++		goto out;
++	}
++	printf("SWEET RPMH: ARC %s raise before=%#x table-count=%u target-vlvl=%u\n",
++	    res, before, count, target_vlvl);
++	if (before >= count) {
++		printf("SWEET RPMH: ARC %s reply is not a table index; refusing write\n", res);
++		error = EINVAL;
++		goto out;
++	}
++	if (level[before] >= target_vlvl) {
++		printf("SWEET RPMH: ARC %s already at/above vlvl=%u; no write\n",
++		    res, level[before]);
++		error = 0;
++		goto out;
++	}
++	for (selector = 0; selector < count; ++selector) {
++		if (level[selector] >= target_vlvl) {
+ 			break;
+ 		}
+-		for (unsigned j = 0; j < count; ++j) {
+-			uint32_t e = entries + RH_DB_ENTRY * j;
+-			char name[9] = {0};
+-			for (unsigned k = 0; k < 8; ++k) {
+-				name[k] = (char)(rh_read(rh_db, e + 4u * (k / 4)) >>
+-				    (8u * (k % 4)) & 0xffu);
+-			}
+-			printf("SWEET RPMH: db %s addr=%#x slave=%u\n",
+-			    name, rh_read(rh_db, e + 16), slave);
+-		}
++	}
++	if (selector == 0 || selector >= count) {
++		printf("SWEET RPMH: ARC %s no safe selector >= target; refusing write\n", res);
++		error = ERANGE;
++		goto out;
++	}
++	printf("SWEET RPMH: ARC %s raise selector=%u vlvl=%u from=%#x vlvl=%u\n",
++	    res, selector, level[selector], before, level[before]);
++	{
++		const uint32_t offset = 0;
++		const uint32_t value = selector;
++		error = rh_send_cmds(res, 0, RH_ACTIVE_N, "ACTIVE", found.addr, 3u, &offset, &value, 1,
++		    RH_ARC_TIMEOUT_US, NULL);
++	}
++	if (error) {
++		goto out;
++	}
++	error = rh_arc_read_locked(res, &found, level, &count, &after);
++	if (error) {
++		goto out;
++	}
++	printf("SWEET RPMH: ARC %s raise after=%#x expected=%u\n",
++	    res, after, selector);
++	if (after != selector) {
++		printf("SWEET RPMH: ARC %s raise readback mismatch; no retry, no GPUCC access\n", res);
++		error = EIO;
++	} else if (after >= count) {
++		printf("SWEET RPMH: ARC %s raise readback index outside table; no retry\n", res);
++		error = EIO;
++	} else {
++		printf("SWEET RPMH: ARC %s raise verified selector=%u vlvl=%u\n",
++		    res, selector, level[after]);
+ 	}
+ out:
++	if (error) {
++		printf("SWEET RPMH: ARC raise %s failed errno=%d\n", res, error);
++	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..3df053e 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -15,6 +15,7 @@
+ #include <kern/clock.h>
+ #include <kern/processor.h>
+ #include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -54,6 +55,7 @@ public:
+ 	void haltCPU(void) APPLE_KEXT_OVERRIDE;
+ 	void signalCPU(IOCPU *target) APPLE_KEXT_OVERRIDE;
+ 	const OSSymbol *getCPUName(void) APPLE_KEXT_OVERRIDE;
++	processor_t processor(void) const { return machProcessor; }
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetCPU, IOCPU);
+@@ -121,6 +123,123 @@ SweetCPU::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * CPU DVFS through the SM7150 cpufreq-hw (OSM) domains. Nothing in this
++ * kernel ever wrote REG_PERF_STATE, so the cores stayed at whatever index the
++ * bootloader left. Register layout is Linux qcom-cpufreq-hw.c qcom_soc_data
++ * (the pinned sm7150.dtsi uses "qcom,cpufreq-hw"): enable 0x0, LUT 0x110 and
++ * voltage 0x114 in 32-byte rows, current (throttled) vote 0x704, perf state
++ * 0x920. The hardware owns voltage (CPR) and limits management; only a LUT
++ * index is written. Each cluster's clock is estimated before and after from
++ * a dependent-add chain against the architected timer, on a bound core.
++ * sweetcpufreq=0 logs only; 1 (default) selects the highest non-boost row.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" processor_t thread_bind(processor_t);
++
++#define SWEET_OSM_ENABLE        0x000
++#define SWEET_OSM_DCVS_CTRL     0x0bc
++#define SWEET_OSM_FREQ_LUT      0x110
++#define SWEET_OSM_VOLT_LUT      0x114
++#define SWEET_OSM_CURRENT_VOTE  0x704
++#define SWEET_OSM_PERF_STATE    0x920
++#define SWEET_OSM_LUT_ROW       32u
++#define SWEET_OSM_LUT_MAX       40u
++#define SWEET_OSM_XO_KHZ        19200u
++#define SWEET_OSM_GPLL0_KHZ     300000u
++
++/* 64 dependent adds per iteration: one per cycle on both A55 and A76. */
++static uint64_t
++sweet_cpu_measure_khz(void)
++{
++	const uint64_t iterations = 20000;
++	boolean_t enabled = ml_set_interrupts_enabled(FALSE);
++	uint64_t acc = 0, n = iterations;
++	uint64_t begin = mach_absolute_time();
++	__asm__ volatile(
++		"1:\n"
++		".rept 64\n"
++		"add %0, %0, #1\n"
++		".endr\n"
++		"subs %1, %1, #1\n"
++		"b.ne 1b\n"
++		: "+r"(acc), "+r"(n) : : "cc");
++	uint64_t ticks = mach_absolute_time() - begin;
++	ml_set_interrupts_enabled(enabled);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(ticks, &ns);
++	return ns ? (iterations * 64 * 1000000ULL) / ns : 0;
++}
++
++static void
++sweet_cpufreq_domain(const ml_topology_info_t *topology, unsigned domain,
++    uint64_t pa, unsigned first_cpu, int mode)
++{
++	volatile uint32_t *osm = (volatile uint32_t *)ml_io_map(pa, 0x1400);
++	if (osm == NULL || first_cpu >= topology->num_cpus || sweet_cpus[first_cpu] == NULL) {
++		IOLog("SWEET CPUFREQ: domain %u unavailable\n", domain);
++		return;
++	}
++	const uint32_t enable = osm[SWEET_OSM_ENABLE / 4];
++	const uint32_t dcvs = osm[SWEET_OSM_DCVS_CTRL / 4];
++	const uint32_t state = osm[SWEET_OSM_PERF_STATE / 4];
++	const uint32_t vote = osm[SWEET_OSM_CURRENT_VOTE / 4];
++	IOLog("SWEET CPUFREQ: domain %u pa=0x%llx enable=%#x dcvs=%#x perf_state=%u current_vote=%#x (%u kHz)\n",
++	    domain, pa, enable, dcvs, state, vote, (vote & 0x3ff) * SWEET_OSM_XO_KHZ);
++	if (!(enable & 1)) {
++		IOLog("SWEET CPUFREQ: domain %u hardware not enabled; no write\n", domain);
++		return;
++	}
++	uint32_t khz[SWEET_OSM_LUT_MAX] = {0};
++	unsigned rows = 0, best = SWEET_OSM_LUT_MAX;
++	for (unsigned i = 0; i < SWEET_OSM_LUT_MAX; i++) {
++		const uint32_t data = osm[(SWEET_OSM_FREQ_LUT + i * SWEET_OSM_LUT_ROW) / 4];
++		const uint32_t volt = osm[(SWEET_OSM_VOLT_LUT + i * SWEET_OSM_LUT_ROW) / 4];
++		const uint32_t src = data >> 30, lval = data & 0xff, cores = (data >> 16) & 7;
++		khz[i] = src ? SWEET_OSM_XO_KHZ * lval : SWEET_OSM_GPLL0_KHZ;
++		IOLog("SWEET CPUFREQ: domain %u lut %u data=%#x %u kHz cores=%u volt=%u mV\n",
++		    domain, i, data, khz[i], cores, volt & 0xfff);
++		/* Linux: a repeated frequency ends the table. */
++		if (i > 0 && khz[i] == khz[i - 1]) {
++			break;
++		}
++		rows = i + 1;
++		/* core_count 1 marks a boost-only row (LUT_TURBO_IND). */
++		if (cores != 1 && (best == SWEET_OSM_LUT_MAX || khz[i] > khz[best])) {
++			best = i;
++		}
++	}
++	processor_t processor = sweet_cpus[first_cpu]->processor();
++	thread_bind(processor);
++	thread_block(THREAD_CONTINUE_NULL);
++	const uint64_t before = sweet_cpu_measure_khz();
++	IOLog("SWEET CPUFREQ: domain %u cpu=%d measured before=%llu kHz (LUT state %u = %u kHz)\n",
++	    domain, cpu_number(), before, state, state < rows ? khz[state] : 0);
++	if (mode == 1 && best < rows && best != state) {
++		osm[SWEET_OSM_PERF_STATE / 4] = best;
++		__builtin_arm_dsb(DSB_SY);
++		IOSleep(5);
++		const uint64_t after = sweet_cpu_measure_khz();
++		IOLog("SWEET CPUFREQ: domain %u selected lut %u = %u kHz; readback perf_state=%u current_vote=%#x (%u kHz) measured after=%llu kHz\n",
++		    domain, best, khz[best], osm[SWEET_OSM_PERF_STATE / 4],
++		    osm[SWEET_OSM_CURRENT_VOTE / 4], (osm[SWEET_OSM_CURRENT_VOTE / 4] & 0x3ff) * SWEET_OSM_XO_KHZ, after);
++	} else {
++		IOLog("SWEET CPUFREQ: domain %u no write (mode=%d best=%u rows=%u)\n", domain, mode, best, rows);
++	}
++	thread_bind(PROCESSOR_NULL);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++sweet_cpufreq_start(const ml_topology_info_t *topology)
++{
++	int mode = 1;
++	PE_parse_boot_argn("sweetcpufreq", &mode, sizeof(mode));
++	/* Pinned sm7150.dtsi: cpu0-5 freq-domain 0, cpu6-7 freq-domain 1. */
++	sweet_cpufreq_domain(topology, 0, 0x18323000ULL, 0, mode);
++	sweet_cpufreq_domain(topology, 1, 0x18325800ULL, 6, mode);
++}
++
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
+ void
+ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -175,6 +294,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	sweet_cpufreq_start(topology);
+ 	thread_terminate(current_thread());
+ }
+ 

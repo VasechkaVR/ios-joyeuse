@@ -1,0 +1,1138 @@
+diff --git a/iokit/Kernel/arm/SweetAdrenoDMA.cpp b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
+new file mode 100644
+index 0000000..fe5123a
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAdrenoDMA.cpp
+@@ -0,0 +1,88 @@
++/* SPDX-License-Identifier: MIT
++ * Wired, uncached memory for the Adreno SMMU and legacy GMU HFI.
++ */
++#if defined(SWEET) || defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <mach/mach_types.h>
++#include <kern/task.h>
++#include <sys/errno.h>
++#include "../../../bsd/dev/sweet_adreno_cp.h"
++
++static IOBufferMemoryDescriptor *sweet_adreno_storage;
++extern "C" int
++sweet_adreno_dma_allocate(struct a618_dma_region *region)
++{
++ if (!region) return EINVAL;
++ if (sweet_adreno_storage) return EALREADY;
++ IOBufferMemoryDescriptor *storage = IOBufferMemoryDescriptor::inTaskWithOptions(
++     kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous |
++     kIOMemoryMapperNone | kIOMapInhibitCache, A618_DMA_BYTES, 0x4000);
++ if (!storage) return ENOMEM;
++ if (storage->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++  storage->release(); return EIO;
++ }
++ IOByteCount contiguous = 0;
++ uint64_t physical = storage->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
++ void *cpu = storage->getBytesNoCopy();
++ if (!cpu || !physical || (physical & 0x3fff) || contiguous < A618_DMA_BYTES ||
++     physical > (1ull << 36) - A618_DMA_BYTES) {
++  storage->complete(kIODirectionInOut); storage->release(); return ERANGE;
++ }
++ /* Do not free this allocation after publishing any SMMU mapping, including
++  * on timeout: hardware ownership may be uncertain. One allocation per boot.
++  */
++ sweet_adreno_storage = storage;
++ region->cpu = (unsigned char *)cpu;
++ region->physical = physical;
++ region->bytes = A618_DMA_BYTES;
++ region->uncached = 1;
++ /* Cache-inhibited mappings may be Device memory: avoid bzero/DC ZVA
++  * and vectorized stores. Use naturally aligned volatile word stores. */
++ volatile uint32_t *words = (volatile uint32_t *)cpu;
++ for (unsigned i = 0; i < A618_DMA_BYTES / 4; ++i) words[i] = 0;
++ __asm__ volatile("dsb sy" ::: "memory");
++ return 0;
++}
++
++/* CP storage and PAS metadata have separate lifetimes and separate physical
++ * pages; TrustZone may protect the metadata page during authentication. */
++static IOBufferMemoryDescriptor *sweet_aux_storage[2];
++static int
++sweet_aux_allocate(unsigned index, unsigned bytes, struct a618_dma_region *region)
++{
++ if (!region || index > 1) return EINVAL;
++ if (sweet_aux_storage[index]) return EALREADY;
++ IOBufferMemoryDescriptor *storage = IOBufferMemoryDescriptor::inTaskWithOptions(
++     kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous |
++     kIOMemoryMapperNone | kIOMapInhibitCache, bytes, 0x4000);
++ if (!storage) return ENOMEM;
++ if (storage->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++  storage->release(); return EIO;
++ }
++ IOByteCount contiguous = 0;
++ uint64_t physical = storage->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
++ void *cpu = storage->getBytesNoCopy();
++ if (!cpu || !physical || (physical & 0x3fff) || contiguous < bytes ||
++     physical > (1ull << 36) - bytes) {
++  storage->complete(kIODirectionInOut); storage->release(); return ERANGE;
++ }
++ sweet_aux_storage[index] = storage;
++ region->cpu = (unsigned char *)cpu;
++ region->physical = physical; region->bytes = bytes; region->uncached = 1;
++ volatile uint32_t *words = (volatile uint32_t *)cpu;
++ for (unsigned i = 0; i < bytes / 4; ++i) words[i] = 0;
++ __asm__ volatile("dsb sy" ::: "memory");
++ return 0;
++}
++extern "C" int
++sweet_adreno_cp_allocate(struct a618_dma_region *region)
++{
++ return sweet_aux_allocate(0, A618_CP_DMA_BYTES, region);
++}
++extern "C" int
++sweet_adreno_pas_allocate(struct a618_dma_region *region)
++{
++ return sweet_aux_allocate(1, 0x4000, region);
++}
++#endif
+diff --git a/iokit/Kernel/arm/SweetIOAccelerator.h b/iokit/Kernel/arm/SweetIOAccelerator.h
+new file mode 100644
+index 0000000..ffd5f86
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetIOAccelerator.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: MIT
++ * Shared IOAcceleratorES base class.
++ *
++ * QuartzCore looks up IOServiceMatching("IOAcceleratorES") once per process.
++ * The framebuffer publishes an empty instance for software-only boots; the
++ * Adreno transport subclasses the same class and publishes the real device
++ * once GPU bring-up completes.  Keeping one meta-class definition avoids a
++ * duplicate ODR symbol when both translation units are linked.
++ */
++#ifndef _SWEET_IO_ACCELERATOR_H
++#define _SWEET_IO_ACCELERATOR_H
++
++#include <IOKit/IOService.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++#endif /* _SWEET_IO_ACCELERATOR_H */
+diff --git a/iokit/Kernel/arm/SweetNativeAdreno.cpp b/iokit/Kernel/arm/SweetNativeAdreno.cpp
+new file mode 100644
+index 0000000..c229b89
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNativeAdreno.cpp
+@@ -0,0 +1,140 @@
++/* SPDX-License-Identifier: MIT
++ * Sweet/A618 adapter for the MIT UniXNU ring core. Kernel callers only.
++ * Keeps the proven 16K-host/4K-GPU mappings and existing CP owner alive.
++ * No IOKit accelerator or userspace PM4 interface is published here.
++ */
++#include <IOKit/IOLib.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include "../../../bsd/dev/sweet_adreno_cp.h"
++#include "unixnu/NativeAdrenoRing.h"
++
++extern "C" int sweet_native_adreno_connect_vm(NativeAdrenoRing *,IOLock *,const NativeAdrenoRingClock *,
++    uintptr_t,int (*)(void *),int (*)(void *,uint32_t,uint32_t *));
++static NativeAdrenoRing native_ring;
++static IOLock *native_lock;
++static struct {
++ struct a618_dma_region memory;
++ volatile unsigned char *core, *gmu, *smmu;
++ bool mounted;
++} board;
++static uint32_t reg_read(volatile unsigned char *base, unsigned offset)
++{
++ uint32_t value=*reinterpret_cast<volatile uint32_t *>(base+offset);
++ __asm__ volatile("dmb oshld" ::: "memory");
++ return value;
++}
++static bool faulted()
++{
++ const uint32_t irq=reg_read(board.core,0x208c), hw=reg_read(board.core,0x2084);
++ const uint32_t fsr=reg_read(board.smmu,0x8058), gmu=reg_read(board.gmu,0x14648);
++ const uint32_t global=reg_read(board.core,0x804);
++ const uint32_t errors=(1u<<1)|(1u<<7)|(1u<<9)|(1u<<23)|(1u<<24)|(1u<<25);
++ return global==UINT32_MAX || (global&errors) || irq==UINT32_MAX || (irq&0xf7u) || hw || fsr==UINT32_MAX ||
++     (fsr&0xc00001feu) || gmu==UINT32_MAX || (gmu&(1u<<23));
++}
++/* One-time evidence for the first lost GPU: every term faulted() tests, plus
++ * the SMMU fault address/syndrome and the CP read pointer. Read-only. */
++extern "C" void sweet_native_adreno_fault_report(const char *why)
++{
++ if(!board.core || !board.smmu || !board.gmu)return;
++ const uint32_t irq=reg_read(board.core,0x208c), hw=reg_read(board.core,0x2084);
++ const uint32_t fsr=reg_read(board.smmu,0x8058), gmu=reg_read(board.gmu,0x14648);
++ const uint32_t global=reg_read(board.core,0x804);
++ const uint64_t far=(uint64_t)reg_read(board.smmu,0x8060)|((uint64_t)reg_read(board.smmu,0x8064)<<32);
++ IOLog("SWEET RENDER: GPU LOST (%s): RBBM_INT=%#x CP_INT=%#x CP_HW_FAULT=%#x CB0_FSR=%#x FAR=%#llx FSYNR0=%#x FSYNR1=%#x CB1_FSR=%#x GMU_HOST_INFO=%#x CP_RPTR=%#x CP_STATUS1=%#x\n",
++   why,global,irq,hw,fsr,far,reg_read(board.smmu,0x8068),reg_read(board.smmu,0x806c),
++   reg_read(board.smmu,0x9058),gmu,reg_read(board.core,0x2018),reg_read(board.core,0x2094));
++}
++static int io_read(void *,uint32_t index,uint32_t *value)
++{
++ if(!value || index>=0x10000 || faulted())return 1;
++ *value=reg_read(board.core,index*4);
++ return *value==UINT32_MAX;
++}
++static int io_barrier(void *)
++{
++ __asm__ volatile("dsb sy" ::: "memory");
++ return faulted()?1:0;
++}
++static int io_write(void *,uint32_t index,uint32_t value)
++{
++ /* Adoption writes nothing; runtime submission may only commit WPTR. */
++ if(index!=0x807 || value>=8192 || faulted())return 1;
++ for(unsigned us=0;us<1000;us+=10) {
++  __asm__ volatile("dmb oshst" ::: "memory");
++  *reinterpret_cast<volatile uint32_t *>(board.core+index*4)=value;
++  __asm__ volatile("dsb sy" ::: "memory");
++  uint32_t status=reg_read(board.gmu,A618_GMU_AHB_FENCE_STATUS);
++  if(status==UINT32_MAX)return 1;
++  if(!(status&1))return faulted()?1:0;
++  IODelay(10);
++ }
++ return 1;
++}
++static int publish(void *,const volatile uint32_t *words,size_t bytes)
++{
++ if(reinterpret_cast<uintptr_t>(words)!=reinterpret_cast<uintptr_t>(board.memory.cpu+A618_CP_RING_OFFSET) ||
++    bytes!=0x8000)return 1;
++ return io_barrier(nullptr);
++}
++static int acquire(void *,volatile uint32_t *words,size_t bytes)
++{
++ const uintptr_t at=reinterpret_cast<uintptr_t>(words);
++ const uintptr_t start=reinterpret_cast<uintptr_t>(board.memory.cpu+A618_CP_FENCE_OFFSET);
++ if(at<start || bytes>0x4000 || at-start>0x4000-bytes)return 1;
++ return io_barrier(nullptr); /* original backing is cache-inhibited */
++}
++static uint64_t now_us(void *)
++{
++ uint64_t ns=0;
++ absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
++ return ns/1000;
++}
++static int idle(void *) {IODelay(10);return 0;}
++extern "C" int sweet_native_adreno_adopt(const struct a618_dma_region *memory,
++    uintptr_t core,uintptr_t gmu,uintptr_t smmu,unsigned seed)
++{
++ if(board.mounted || native_lock || !memory || !memory->cpu || !memory->uncached ||
++    memory->bytes!=A618_CP_DMA_BYTES || !core || !gmu || !smmu)return EINVAL;
++ board.memory=*memory;
++ board.core=reinterpret_cast<volatile unsigned char *>(core);
++ board.gmu=reinterpret_cast<volatile unsigned char *>(gmu);
++ board.smmu=reinterpret_cast<volatile unsigned char *>(smmu);
++ native_lock=IOLockAlloc();
++ if(!native_lock)return ENOMEM;
++ const NativeAdrenoRingIo io={nullptr,io_write,io_read,io_barrier};
++ const NativeAdrenoRingCache cache={nullptr,publish,acquire};
++ IOReturn result=native_ring.adoptA6xx(&io,&cache,memory->cpu+A618_CP_RING_OFFSET,0x8000,A618_CP_RING_IOVA,
++     memory->cpu+A618_CP_FENCE_OFFSET,4,A618_CP_FENCE_IOVA,
++     reinterpret_cast<volatile uint32_t *>(memory->cpu+A618_CP_SHADOW_OFFSET),A618_CP_SHADOW_IOVA,seed);
++ const NativeAdrenoRingClock clock={nullptr,now_us,idle};
++ if(result==kIOReturnSuccess && sweet_native_adreno_connect_vm(&native_ring,native_lock,&clock,core,io_barrier,io_read))result=kIOReturnIOError;
++ board.mounted=result==kIOReturnSuccess;
++ IOLog("SWEET NATIVE ADRENO: A618 ring adopt status=%#x ready=%u; kernel-only, no renderer\n",result,board.mounted);
++ return board.mounted?0:EIO;
++}
++/* Private synchronous kernel submission. Caller owns immutable PM4 words;
++ * the ring copies them before WPTR. Never wire to an unchecked userclient.
++ * Timeout retains allocations and marks the adapter unusable; no retry. */
++extern "C" int sweet_native_adreno_submit(const uint32_t *words,unsigned count,unsigned *fence)
++{
++ if(!words || !count || count>4096 || !fence)return EINVAL;
++ *fence=0;
++ if(!board.mounted || !native_lock)return ENXIO;
++ IOLockLock(native_lock);
++ if(!board.mounted) {IOLockUnlock(native_lock);return ENXIO;}
++ uint32_t issued=0;
++ IOReturn result=native_ring.submit(words,count,&issued);
++ int error=result==kIOReturnSuccess?0:EIO;
++ if(!error) {
++  const NativeAdrenoRingClock clock={nullptr,now_us,idle};
++  const NativeAdrenoRingFence completed=native_ring.wait(issued,&clock,10000,nullptr);
++  if(completed!=NativeAdrenoRingFenceComplete)error=completed==NativeAdrenoRingFenceTimeout?ETIMEDOUT:EIO;
++ }
++ if(error)board.mounted=false;
++ else *fence=issued;
++ IOLockUnlock(native_lock);
++ return error;
++}
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+new file mode 100644
+index 0000000..d8e7c78
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNativeAdrenoClient.cpp
+@@ -0,0 +1,596 @@
++/* SPDX-License-Identifier: MIT
++ * IOKit transport for the real NativeAdreno ABI. One compositor connection,
++ * one resource gate, synchronous quiescence before VM edits/cache publication.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <sys/proc.h>
++#include <sys/signal.h>
++#include "unixnu/NativeAdrenoUserClient.h"
++#include "SweetIOAccelerator.h"
++extern "C" void proc_selfname(char *,int);
++extern "C" volatile uint32_t native_adreno_wc_enabled;
++extern "C" volatile uint32_t native_adreno_wc_audit[6];
++extern "C" volatile uint32_t native_adreno_wc_distrusted;
++extern "C" uint64_t native_adreno_publish_stats[3];
++extern "C" volatile uint32_t native_adreno_import_sync;
++extern "C" volatile uint64_t native_adreno_import_sync_below;
++extern "C" void sweet_native_adreno_fault_report(const char *why);
++extern "C" volatile uint32_t native_adreno_pool_stats[8];
++namespace {
++struct Backend {
++ NativeAdrenoVm *vm=nullptr;
++ NativeAdrenoSubmit *submit=nullptr;
++ NativeAdrenoRing *ring=nullptr;
++ IOLock *lock=nullptr;
++ NativeAdrenoRingClock clock{};
++ NativeAdrenoTimer timer;
++ NativeAdrenoStatus status;
++ NativeAdrenoAbiDeviceInfo info{};
++ int (*health)(void *)=nullptr;
++ bool published=false,opened=false,lost=false,cpu_present=false;
++ bool pipeline=true;   // sweetpipeline=0 restores a full drain before every submit/map
++ bool present_locked=false;   // sweetpresentlock=1: present holds the lock across drain and copy
++ bool present_swap_fence=false;   // sweetpresentfence=1: wait for the SwapEnd-time fence
++ bool wait_unlocked=true;   // sweetwaitlock=1: WaitFence spins with the lock held, as before 0144
++ /* Slot 0 is backboardd's original window. Extra slots are separate 256 MiB
++  * windows of the same 2 GiB arena above it, each with its own queue range,
++  * so one client's IOVAs can never collide with another's. */
++ bool slot_open[4]={false,false,false,false};
++ unsigned extra_slots=3;
++} backend;
++/* 0x70000000.. holds the kernel's CP firmware/ring/fence (A618_CP_IOVA): the
++ * 0129 windows overlapped it and every extra BoMap was refused as Busy. */
++enum : uint64_t {ExtraWindowStart=0x80000000,ExtraWindowBytes=0x10000000};
++/* Processes that receive a Metal device besides backboardd. AegirPoster (the
++ * configured iOS 16 wallpaper) aborts without one; sweetm2extra=0 disables. */
++bool extra_client(const char *name)
++{
++ static const char *const names[]={"AegirPoster"};
++ for(const char *n:names)if(!strcmp(name,n))return true;
++ return false;
++}
++// Release/acquire publishes the completed backend to the framebuffer workloop.
++static bool presentation_ready=false;
++char last_submitter[32];   // process of the newest successful submit (diagnostics)
++bool healthy()
++{
++ if(backend.lost)return false;
++ const bool fault=!backend.health || backend.health(nullptr);
++ if(fault || backend.vm->poisoned() || backend.submit->poisoned() || backend.ring->poisoned()) {
++  backend.lost=true;backend.status.noteFault();
++  char why[96];
++  snprintf(why,sizeof why,"%s%s%s%s last_submit=%s fence=%u/%u",fault?"hw-fault ":"",
++    backend.vm->poisoned()?"vm ":"",backend.submit->poisoned()?"submit ":"",
++    backend.ring->poisoned()?"ring ":"",last_submitter,backend.ring->completedFence(),backend.ring->lastSubmitted());
++  sweet_native_adreno_fault_report(why);
++  return false;
++ }
++ return true;
++}
++IOReturn quiesce()
++{
++ if(!healthy())return kIOReturnIOError;
++ IOReturn result=backend.submit->waitAll(&backend.clock,1000000);
++ if(!result)result=backend.ring->drainA6xx(&backend.clock,1000000);
++ if(result) {
++  // 0130 hardware: the backend was lost here (no faulted() term) right after
++  // an AegirPoster instance was killed; say so with the CP state.
++  backend.lost=true;backend.status.noteFault();
++  char why[96];
++  snprintf(why,sizeof why,"quiesce %#x last_submit=%s fence=%u/%u",result,last_submitter,
++    backend.ring->completedFence(),backend.ring->lastSubmitted());
++  sweet_native_adreno_fault_report(why);
++ }
++ return result;
++}
++}
++/* The panel is CPU-copied, unlike a display engine that consumes a GPU fence.
++ * Hold the shared submission/VM gate across quiescence and the source copy so
++ * another submit cannot overwrite its source during the CPU read. This waits
++ * real CP fences; it never declares pending work complete. */
++/* 1 = lock held until present_end (sweetpresentlock=1: full drain, then the
++ * copy under the lock, as 0125-0131). 2 = gate passed without the lock: wait
++ * only for the newest fence submitted when presenting starts, with the lock
++ * taken just for each instantaneous check. CACHE_FLUSH_TS writes that fence
++ * after the frame's render output, and present() still does the physical
++ * cache acquire. 0127 hardware: holding the lock 15-22ms per present
++ * serialized CoreAnimation's submissions behind the copy. */
++/* Newest fence handed out (0 before publication); read without the lock:
++ * a monotonic counter, used only to pick a wait target. */
++extern "C" uint32_t sweet_native_adreno_last_fence(void)
++{
++ if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.ring)return 0;
++ return backend.ring->lastSubmitted();
++}
++/* swap_fence: sweet_native_adreno_last_fence() when SwapEnd recorded the frame.
++ * sweetpresentfence=1 waits for that one (the frame being shown) instead of
++ * the newest fence, which may belong to CoreAnimation's next frame. */
++extern "C" int sweet_native_adreno_cpu_present_begin(uint32_t swap_fence)
++{
++ if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.cpu_present)return 0;
++ const uint64_t began=backend.clock.now_us(backend.clock.cookie);
++ static unsigned presents=0;
++ if(backend.present_locked) {
++  IOLockLock(backend.lock);
++  const IOReturn result=quiesce();
++  if(++presents<=4 || presents%120==0)
++   IOLog("SWEET RENDER: CPU present gate %u wait_us=%llu result=%#x locked\n",presents,
++     backend.clock.now_us(backend.clock.cookie)-began,result);
++  if(result) {IOLockUnlock(backend.lock);return -1;}
++  return 1;
++ }
++ IOLockLock(backend.lock);
++ const bool ok=healthy();
++ const uint32_t newest=ok?backend.ring->lastSubmitted():0;
++ const uint32_t target=backend.present_swap_fence && swap_fence && swap_fence-newest>0x80000000u?swap_fence:newest;
++ IOLockUnlock(backend.lock);
++ IOReturn result=ok?kIOReturnSuccess:kIOReturnIOError;
++ while(ok && target) {
++  IOLockLock(backend.lock);
++  result=healthy()?backend.submit->observeFence(target,&backend.clock,0):kIOReturnIOError;
++  IOLockUnlock(backend.lock);
++  if(result!=kIOReturnTimeout)break;
++  if(backend.clock.now_us(backend.clock.cookie)-began>=1000000)break;
++  IODelay(50);
++ }
++ if(++presents<=4 || presents%120==0)
++  IOLog("SWEET RENDER: CPU present gate %u fence=%u wait_us=%llu result=%#x unlocked\n",presents,target,
++    backend.clock.now_us(backend.clock.cookie)-began,result);
++ return result?-1:2;
++}
++extern "C" void sweet_native_adreno_cpu_present_end(int state)
++{
++ if(state==1)IOLockUnlock(backend.lock);
++}
++/* Per-window GPU and lock telemetry (0144). Busy is sampled from the
++ * framebuffer's 120 Hz timer: the newest fence still incomplete. A sample
++ * that finds the lock taken is counted apart rather than guessed. */
++namespace {
++struct MethodStat {uint64_t calls,us;};
++MethodStat method_stats[NativeAdrenoMethodSubmitResources+1];
++uint64_t lock_wait_us,lock_wait_max_us,lock_takes,wait_polls;
++unsigned busy_samples,idle_samples,locked_samples;
++uint64_t window_began_us;
++/* 0171: which blocks of the GPU are busy while a fence is outstanding (RBBM_STATUS, a6xx.xml bit names). Read only then,
++ * so the core is awake; a statistical profile of the 10 s window, not a count of cycles. */
++unsigned rbbm_samples,rbbm_idle,rbbm_bits[24];
++volatile uint32_t *rbbm_status;
++const char *const rbbm_names[24]={"CXM","CPM","CP","DBGC","VBIF","TSE","RAS","RB","CCU","A2D","LRZ","DCOM","DCALL","VSD","TESS",
++ "VFD","VPC","UCHE","SP","TPL1","VSC","HLSQ","IGNCP","IGN"};
++}
++extern "C" vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
++extern "C" void sweet_native_adreno_sample_busy(void)
++{
++ if(!__atomic_load_n(&presentation_ready,__ATOMIC_ACQUIRE) || !backend.ring)return;
++ if(!IOLockTryLock(backend.lock)) {++locked_samples;return;}
++ const uint32_t newest=healthy()?backend.ring->lastSubmitted():0;
++ const IOReturn state=newest?backend.submit->observeFence(newest,&backend.clock,0):kIOReturnSuccess;
++ if(state==kIOReturnTimeout)++busy_samples;else ++idle_samples;
++  if(state==kIOReturnTimeout) {
++  if(!rbbm_status) {const vm_offset_t core=ml_io_map(0x05000000,0x40000);if(core)rbbm_status=(volatile uint32_t *)(core+0x840);}
++  const uint32_t st=rbbm_status?*rbbm_status:0xffffffffu;
++  if(st!=0xffffffffu) {
++   ++rbbm_samples;
++   if(!(st&~1u))++rbbm_idle;
++   for(unsigned b=0;b<24;b++)if(st&(1u<<b))++rbbm_bits[b];
++  }
++ }
++ IOLockUnlock(backend.lock);
++}
++/* Called with the lock held after each method; prints once per 10 s. */
++static void method_window(void)
++{
++ const uint64_t now=backend.clock.now_us(backend.clock.cookie);
++ if(!window_began_us) {window_began_us=now;return;}
++ if(now-window_began_us<10000000)return;
++ static const char *const names[]={"0","query","alloc","map","free","submit","wait","ts","status","setmeta","getmeta","mkq","rmq","cpumap","cpuunmap","devinfo","import","submit-res"};
++ char line[320];size_t at=0;
++ for(unsigned i=1;i<=NativeAdrenoMethodSubmitResources && at<sizeof line;i++) {
++  if(!method_stats[i].calls)continue;
++  at+=snprintf(line+at,sizeof line-at," %s=%llu/%llu",i<sizeof names/sizeof names[0]?names[i]:"?",
++    method_stats[i].calls,method_stats[i].us/method_stats[i].calls);
++ }
++ if(at>=sizeof line)at=sizeof line-1;
++ line[at]=0;
++ const unsigned sampled=busy_samples+idle_samples;
++ IOLog("SWEET RENDER: window_ms=%llu gpu_busy_pct=%u samples=%u locked=%u lock_avg_us=%llu lock_max_us=%llu wait_polls=%llu pool_mib=%u/%u peak pooled=%u fallback=%u calls/avg_us:%s\n",
++   (now-window_began_us)/1000,sampled?busy_samples*100/sampled:0,sampled,locked_samples,
++   lock_takes?lock_wait_us/lock_takes:0,lock_wait_max_us,wait_polls,native_adreno_pool_stats[3],native_adreno_pool_stats[4],
++   native_adreno_pool_stats[1],native_adreno_pool_stats[2],line);
++ if(rbbm_samples) {
++  char blocks[400];size_t n=0;
++  for(unsigned b=0;b<24 && n<sizeof blocks-16;b++)if(rbbm_bits[b]*100/rbbm_samples>=3)
++   n+=snprintf(blocks+n,sizeof blocks-n," %s=%u",rbbm_names[b],rbbm_bits[b]*100/rbbm_samples);
++  blocks[n]=0;
++  IOLog("SWEET RENDER: rbbm samples=%u (fence outstanding) idle=%u%% busy blocks%%:%s\n",rbbm_samples,rbbm_idle*100/rbbm_samples,blocks);
++ }
++ rbbm_samples=rbbm_idle=0;memset(rbbm_bits,0,sizeof rbbm_bits);
++ memset(method_stats,0,sizeof method_stats);
++ lock_wait_us=lock_wait_max_us=lock_takes=wait_polls=0;busy_samples=idle_samples=locked_samples=0;
++ window_began_us=now;
++}
++static void lock_timed(void)
++{
++ const uint64_t asked=backend.clock.now_us(backend.clock.cookie);
++ IOLockLock(backend.lock);
++ const uint64_t waited=backend.clock.now_us(backend.clock.cookie)-asked;
++ lock_wait_us+=waited;++lock_takes;if(waited>lock_wait_max_us)lock_wait_max_us=waited;
++}
++class AGXDeviceUserClient : public IOUserClient {
++ OSDeclareDefaultStructors(AGXDeviceUserClient)
++ NativeAdrenoUserClient *core_=nullptr;
++ task_t task_=TASK_NULL;
++ bool mounted_=false,closed_=false;
++ unsigned slot_=0;
++ NativeAdrenoAbiDeviceInfo info_{};   // this client's window; outlives core_
++ unsigned trace_calls_=0,trace_errors_=0;
++public:
++ bool mount(task_t task,void *securityID,UInt32 type,OSDictionary *properties,unsigned slot);
++ IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
++     IOExternalMethodDispatch *dispatch,OSObject *target,void *reference) APPLE_KEXT_OVERRIDE;
++ IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++ IOReturn clientClose() APPLE_KEXT_OVERRIDE;
++ void free() APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AGXDeviceUserClient,IOUserClient)
++/* Userland discovery matches this class, then loads the actual Metal bundle.
++ * The service is published only after VM, CP, render profile and transport are
++ * connected; unsupported Apple IOAccelerator command types stay unsupported. */
++class AGXAccelerator : public IOAcceleratorES {
++ OSDeclareDefaultStructors(AGXAccelerator)
++public:
++ IOReturn newUserClient(task_t task,void *securityID,UInt32 type,OSDictionary *properties,
++     IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(AGXAccelerator,IOAcceleratorES)
++bool AGXDeviceUserClient::mount(task_t task,void *securityID,UInt32 type,OSDictionary *properties,unsigned slot)
++{
++ if(!IOUserClient::initWithTask(task,securityID,type,properties))return false;
++ task_=task;slot_=slot;info_=backend.info;
++ if(slot) {
++  info_.va_start=ExtraWindowStart+(uint64_t)(slot-1)*ExtraWindowBytes;
++  info_.va_size=ExtraWindowBytes;
++  if(info_.va_start<backend.info.va_start+backend.info.va_size)return false;
++ }
++ core_=new NativeAdrenoUserClient;
++ if(!core_)return false;
++ IOReturn error=core_->open(NativeAdrenoAbiVersion,backend.vm,backend.submit,backend.ring,32,36);
++ if(!error)error=core_->setScope(slot*NativeAdrenoAbiMaxQueues,info_.va_start,info_.va_size);
++ if(!error)error=core_->attachTimer(&backend.timer);
++ if(!error)error=core_->attachStatus(&backend.status);
++ if(!error)error=core_->attachDeviceInfo(&info_);
++ if(error) {if(core_->close()!=kIOReturnSuccess)backend.lost=true;return false;}
++ mounted_=true;return true;
++}
++IOReturn AGXAccelerator::newUserClient(task_t task,void *securityID,UInt32 type,
++    OSDictionary *properties,IOUserClient **handler)
++{
++ if(!handler)return kIOReturnBadArgument;
++ *handler=nullptr;
++ if(type!=0x4147 || task!=current_task())return kIOReturnUnsupported;
++ char name[32]={};proc_selfname(name,sizeof name);
++ const bool compositor=!strcmp(name,"backboardd");
++ if(!compositor && !(backend.extra_slots && extra_client(name)))return kIOReturnNotPrivileged;
++ IOLockLock(backend.lock);
++ static unsigned open_traces=0;
++ if(open_traces<16) {++open_traces;IOLog("SWEET RENDER: %s open type=%#x\n",name,type); }
++ unsigned slot=0;
++ if(compositor) {
++  if(backend.opened || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnBusy;}
++ } else {
++  for(slot=1;slot<=backend.extra_slots && backend.slot_open[slot];++slot) {}
++  if(slot>backend.extra_slots || !healthy()) {
++   IOLog("SWEET RENDER: %s refused: no free extra Metal slot\n",name);
++   IOLockUnlock(backend.lock);return kIOReturnBusy;
++  }
++ }
++ auto client=new AGXDeviceUserClient;
++ if(!client || !client->mount(task,securityID,type,properties,slot) || !client->attach(this) || !client->start(this)) {
++  if(client)client->release();
++  IOLockUnlock(backend.lock);return kIOReturnNoResources;
++ }
++ if(compositor)backend.opened=true;
++ backend.slot_open[slot]=true;*handler=client;
++ IOLog("SWEET RENDER: %s client connected ABI=%u slot=%u window=%#llx+%#llx\n",name,NativeAdrenoAbiVersion,
++   slot,slot?ExtraWindowStart+(uint64_t)(slot-1)*ExtraWindowBytes:backend.info.va_start,
++   slot?(uint64_t)ExtraWindowBytes:backend.info.va_size);
++ IOLockUnlock(backend.lock);return kIOReturnSuccess;
++}
++IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
++{
++ if(!options || !memory)return kIOReturnBadArgument;
++ *memory=nullptr;
++ IOLockLock(backend.lock);
++ NativeAdrenoMemory *buffer=mounted_ && !closed_?core_->memoryForToken(type):nullptr;
++ auto descriptor=buffer?buffer->userDescriptor():nullptr;
++ if(!descriptor || buffer->quarantined()) {IOLockUnlock(backend.lock);return kIOReturnBadArgument;}
++ /* Return this same original descriptor on every map/unmap query. Its maps
++  * retain the BO allocation until the last user mapping really disappears. */
++ descriptor->retain();*memory=descriptor;*options=kIOMapDefaultCache;
++ IOLockUnlock(backend.lock);return kIOReturnSuccess;
++}
++IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *,OSObject *,void *)
++{
++ if(!args || args->scalarInputCount || args->scalarOutputCount || args->structureOutputDescriptor)return kIOReturnBadArgument;
++ // Large residency lists arrive via IOKit's out-of-line descriptor. Snapshot
++ // once before validation; never dispatch directly from mutable task memory.
++ struct InputCopy {
++  void *data=nullptr;size_t bytes=0;
++  ~InputCopy(){if(data)IOFree(data,bytes);}
++ } copy;
++ IOExternalMethodArguments forwarded=*args;
++ if(args->structureInputDescriptor) {
++  if(selector!=NativeAdrenoMethodSubmitResources ||
++     args->structureInputDescriptor->getLength()!=sizeof(NativeAdrenoAbiSubmitResources))return kIOReturnBadArgument;
++  copy.bytes=sizeof(NativeAdrenoAbiSubmitResources);copy.data=IOMalloc(copy.bytes);
++  if(!copy.data)return kIOReturnNoMemory;
++  IOReturn prepare=args->structureInputDescriptor->prepare(kIODirectionOut);
++  if(prepare)return prepare;
++  const bool copied=args->structureInputDescriptor->readBytes(0,copy.data,copy.bytes)==copy.bytes;
++  IOReturn completed=args->structureInputDescriptor->complete(kIODirectionOut);
++  if(!copied)return kIOReturnVMError;
++  if(completed)return completed;
++  forwarded.structureInput=copy.data;forwarded.structureInputSize=copy.bytes;
++  forwarded.structureInputDescriptor=nullptr;args=&forwarded;
++ }
++ if(args->structureInput && args->structureInputSize>=8) {
++  uint32_t tunnel[2];memcpy(tunnel,args->structureInput,sizeof tunnel);
++  if(tunnel[0]==0x4e544e4c) {
++   if(tunnel[1]==UINT32_MAX) {
++    if(args->structureInputSize!=8 || args->structureOutputSize)return kIOReturnBadArgument;
++    IOLockLock(backend.lock);
++    const bool accepted=mounted_ && !closed_ && healthy();
++    IOLockUnlock(backend.lock);return accepted?kIOReturnSuccess:kIOReturnNotReady;
++   }
++   selector=tunnel[1];
++   forwarded.structureInput=static_cast<const unsigned char *>(args->structureInput)+8;
++   forwarded.structureInputSize-=8;args=&forwarded;
++  }
++ }
++ if(selector<1 || selector>NativeAdrenoMethodSubmitResources)return kIOReturnUnsupported;
++ const size_t input=NativeAdrenoUserClient::inputSize(selector),output=NativeAdrenoUserClient::outputSize(selector);
++ if(args->structureInputSize!=input || args->structureOutputSize!=output ||
++    (input && !args->structureInput) || (output && !args->structureOutput))return kIOReturnBadArgument;
++ /* Turnip waits in 1 ms WaitFence slices. Spinning one under the global lock
++  * stalled every Submit/BoMap/import of the next frame behind the GPU (and
++  * burned a core). Poll the same single check (timeout 0) with the lock
++  * taken only for that check, and block between polls. */
++ if(selector==NativeAdrenoMethodWaitFence && backend.wait_unlocked) {
++  NativeAdrenoAbiWaitFence request{};memcpy(&request,args->structureInput,sizeof request);
++  if(request.timeout_ns) {
++   NativeAdrenoAbiWaitFence poll=request;poll.timeout_ns=0;
++   const uint64_t limit_us=request.timeout_ns/1000?request.timeout_ns/1000:1;
++   const uint64_t began=backend.clock.now_us(backend.clock.cookie);
++   for(;;) {
++    lock_timed();
++    if(!mounted_ || closed_ || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnNotReady;}
++    const IOReturn result=core_->dispatch(selector,&poll,sizeof poll,args->structureOutput,output,&backend.clock);
++    ++wait_polls;
++    const uint64_t now=backend.clock.now_us(backend.clock.cookie);
++    if(result!=kIOReturnTimeout || now-began>=limit_us) {
++     ++method_stats[selector].calls;method_stats[selector].us+=now-began;
++     method_window();
++     if(result && result!=kIOReturnTimeout && trace_errors_++<16)
++      IOLog("SWEET RENDER: method=%u result=%#x\n",selector,result);
++     IOLockUnlock(backend.lock);return result;
++    }
++    IOLockUnlock(backend.lock);
++    IODelay(20);
++   }
++  }
++ }
++ lock_timed();
++ if(!mounted_ || closed_ || !healthy()) {IOLockUnlock(backend.lock);return kIOReturnNotReady;}
++ const uint64_t began=backend.clock.now_us(backend.clock.cookie);
++ uint64_t quiesce_us=0;
++ IOReturn result=kIOReturnSuccess;
++ // BoFree must not unmap while legacy jobs (which hold only their IBs) may
++ // still reference the buffer, so it waits for the actual CP fences. Submit
++ // and BoMap only append: a new mapping uses previously unmapped IOVAs, the
++ // TLB invalidate and the full clean are safe beside running work, and every
++ // job keeps its own fence and references. Pipelining is what lets the CPU
++ // encode frame N+1 while the A618 executes frame N.
++ const bool drains=selector==NativeAdrenoMethodBoFree ||
++     (!backend.pipeline && (selector==NativeAdrenoMethodBoMap || selector==NativeAdrenoMethodSubmit ||
++      selector==NativeAdrenoMethodSubmitResources));
++ if(drains)
++ {
++  result=quiesce();
++  quiesce_us=backend.clock.now_us(backend.clock.cookie)-began;
++ }
++ if(!result && selector==NativeAdrenoMethodBoImport) {
++  NativeAdrenoAbiBoImport request{};NativeAdrenoAbiBoAllocReply reply{};
++  memcpy(&request,args->structureInput,sizeof request);
++  result=core_->importBo(&request,task_,&reply);
++  if(!result)memcpy(args->structureOutput,&reply,sizeof reply);
++ } else if(!result)result=core_->dispatch(selector,args->structureInput,input,args->structureOutput,output,&backend.clock);
++ if(!result)args->structureOutputSize=output;
++ if(selector==NativeAdrenoMethodBoMap) {
++  static unsigned maps=0;
++  if(++maps<=4 || maps%256==0 || result)
++   IOLog("SWEET RENDER: map %u objects=%lu/4128 spans=%lu/%lu total_us=%llu result=%#x\n",maps,
++    (unsigned long)backend.vm->objectCount(),(unsigned long)backend.vm->spanCount(),
++    (unsigned long)backend.vm->spanCapacity(),backend.clock.now_us(backend.clock.cookie)-began,result);
++ }
++ if((selector==NativeAdrenoMethodSubmit || selector==NativeAdrenoMethodSubmitResources) && !result)
++  proc_selfname(last_submitter,sizeof last_submitter);
++ if(selector==NativeAdrenoMethodSubmit) {
++  // Window of 120 legacy submits: kernel time per call and jobs still in
++  // flight after it, i.e. whether the CPU actually ran ahead of the GPU.
++  static unsigned submits=0,busy=0;static uint64_t window_us=0,max_us=0,in_flight=0;
++  const uint64_t spent=backend.clock.now_us(backend.clock.cookie)-began;
++  window_us+=spent;if(spent>max_us)max_us=spent;
++  in_flight+=result?0:backend.submit->outstanding();if(result==kIOReturnBusy)++busy;
++  if(++submits%120==0) {
++   // Full-VM cache publication inside those submits (NativeAdrenoSubmit).
++   const uint64_t ticks=__atomic_exchange_n(&native_adreno_publish_stats[0],0,__ATOMIC_RELAXED);
++   const uint64_t bytes=__atomic_exchange_n(&native_adreno_publish_stats[1],0,__ATOMIC_RELAXED);
++   const uint64_t objects=__atomic_exchange_n(&native_adreno_publish_stats[2],0,__ATOMIC_RELAXED);
++   uint64_t publish_ns=0;absolutetime_to_nanoseconds(ticks,&publish_ns);
++   IOLog("SWEET RENDER: legacy submits %u avg_us=%llu max_us=%llu avg_in_flight_x100=%llu busy=%u drain=%d publish_avg_us=%llu publish_avg_kib=%llu publish_avg_objects=%llu wc_audits=%u dirty=%u stale=%u fail=%#x reasserted=%u distrusted_at=%u\n",submits,
++     window_us/120,max_us,in_flight*100/120,busy,drains,publish_ns/1000/120,bytes/1024/120,objects/120,
++     native_adreno_wc_audit[0],native_adreno_wc_audit[2],native_adreno_wc_audit[3],native_adreno_wc_audit[4],
++     native_adreno_wc_audit[5],native_adreno_wc_distrusted);
++   window_us=max_us=in_flight=0;busy=0;
++  }
++ }
++ if(selector==NativeAdrenoMethodSubmitResources) {
++  static unsigned submissions=0;
++  if(++submissions<=8 || submissions%120==0) {
++   const auto *request=static_cast<const NativeAdrenoAbiSubmitResources *>(args->structureInput);
++   IOLog("SWEET RENDER: scoped submit %u IBs=%u BOs=%u total_us=%llu quiesce_us=%llu result=%#x\n",submissions,
++     request->commands.buffer_count,request->resource_count,
++     backend.clock.now_us(backend.clock.cookie)-began,quiesce_us,result);
++  }
++ }
++
++ bool pending_poll=false;
++ if(selector==NativeAdrenoMethodWaitFence && result==kIOReturnTimeout) {
++  NativeAdrenoAbiWaitFence request{};memcpy(&request,args->structureInput,sizeof request);
++  pending_poll=request.timeout_ns==0;
++ }
++ if(!pending_poll && (trace_calls_++<64 || (result && trace_errors_++<16)))
++  IOLog("SWEET RENDER: method=%u result=%#x\n",selector,result);
++ ++method_stats[selector].calls;method_stats[selector].us+=backend.clock.now_us(backend.clock.cookie)-began;
++ method_window();
++ IOLockUnlock(backend.lock);return result;
++}
++IOReturn AGXDeviceUserClient::clientClose()
++{
++ IOLockLock(backend.lock);
++ if(closed_) {IOLockUnlock(backend.lock);return kIOReturnSuccess;}
++ closed_=true;
++ IOReturn error=mounted_?quiesce():kIOReturnSuccess;
++ if(!error && mounted_)error=core_->releaseAll(&backend.clock,1000000);
++ if(error) {
++  backend.lost=true;
++  char why[64];snprintf(why,sizeof why,"client close %#x slot=%u",error,slot_);
++  sweet_native_adreno_fault_report(why);
++  // Keep uncertain GPU resources and their bookkeeping alive for this boot.
++  retain();
++ } else {
++  mounted_=false;backend.slot_open[slot_]=false;
++  if(!slot_)backend.opened=false;
++  if(slot_)IOLog("SWEET RENDER: extra Metal slot %u closed\n",slot_);
++ }
++ IOLockUnlock(backend.lock);
++ terminate();return error;
++}
++void AGXDeviceUserClient::free()
++{
++ if(core_) {
++  if(mounted_) {
++   // Partial open/start failure: no GPU job was submitted, but do not discard
++   // an object that still owns resources on a failed close.
++   if(core_->close()!=kIOReturnSuccess) {backend.lost=true;core_=nullptr;}
++  }
++  if(core_) {delete core_;core_=nullptr;}
++ }
++ IOUserClient::free();
++}
++extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,
++    NativeAdrenoRing *ring,IOLock *gate,const NativeAdrenoRingClock *clock,
++    int (*health)(void *),int (*read)(void *,uint32_t,uint32_t *),const NativeAdrenoAbiDeviceInfo *info)
++{
++ if(backend.published || !vm || !submit || !ring || !gate || !clock || !clock->now_us || !health || !read || !info)return 1;
++ backend.vm=vm;backend.submit=submit;backend.ring=ring;backend.lock=gate;
++ backend.clock=*clock;backend.health=health;backend.info=*info;
++ const NativeAdrenoTimeIo timerIo={nullptr,read};
++ if(backend.timer.attach(&timerIo,NativeAdrenoTimeCp)!=kIOReturnSuccess || !healthy())return 1;
++ /* Turnip maps every owned BO kIOMapWriteCombineCache, so CPU writes never sit
++  * dirty in a cache; the owned pages are made write-combined to match (the
++  * UniXNU/Sunfish contract). The per-submit IB audit stays armed and on any
++  * dirty line distrusts WC for the rest of the boot (full maintenance again).
++  * 0130 hardware: with WC off the full-VM publish of owned BOs alone grew to
++  * 5.6ms/80MiB per submit. sweetwc=0 restores cacheable owned BOs. */
++ int wc=1;PE_parse_boot_argn("sweetwc",&wc,sizeof(wc));
++ native_adreno_wc_enabled=wc!=0;
++ IOLog("SWEET RENDER: owned BOs %s (sweetwc=%d)\n",wc?"write-combined, IB audit armed":"cacheable with full maintenance",wc);
++ /* 0135 hardware: BoAlloc averaged 22ms (a failing 2MiB contiguous scan of
++  * 255k pages, then one cache-attribute change per page) under the GPU lock.
++  * The UniXNU pool (one contiguous block, write-combined once) was never
++  * reserved here. Owned BOs come from it first; larger or overflow ones keep
++  * the old path. sweetbopool=MiB (0 = off). */
++ uint32_t pool_mib=192;PE_parse_boot_argn("sweetbopool",&pool_mib,sizeof(pool_mib));
++ if(pool_mib) {
++  const uint64_t began=clock->now_us(clock->cookie);
++  IOReturn reserved=kIOReturnNoMemory;uint32_t got=0;
++  for(uint32_t mib=pool_mib>1024?1024:pool_mib;mib>=16 && reserved;mib/=2)
++   if(!(reserved=NativeAdrenoMemory::reservePool(36,(size_t)mib<<20)))got=mib;
++  const IOReturn combined=!reserved && wc?NativeAdrenoMemory::writeCombinePool():kIOReturnSuccess;
++  IOLog("SWEET RENDER: owned BO pool %u MiB reserve=%#x write-combine=%#x in %llu us\n",got,reserved,combined,
++    clock->now_us(clock->cookie)-began);
++ }
++ auto provider=new AGXAccelerator;
++ if(!provider || !provider->init() || !provider->attach(IOService::getPlatform())) {
++  if(provider)provider->release();return 1;
++ }
++ provider->setName("NativeAdrenoGpu");
++ int gles=0,mtl=0;
++ PE_parse_boot_argn("sweetgles",&gles,sizeof(gles));PE_parse_boot_argn("sweetmtl",&mtl,sizeof(mtl));
++ if(gles!=1) {
++  // Both bundles stay installed: sweetmtl=1 selects the old untested
++  // NativeAdrenoMetal stack, anything else the Sunfish-derived SweetMetal2.
++  const char *plugin=mtl==1?"NativeAdrenoMetal":"SweetMetal2";
++  provider->setProperty("MetalPluginName",plugin);
++  provider->setProperty("MetalPluginClassName",mtl==1?"SweetAdrenoMetalDevice":"SweetMTL2Device");
++  IOLog("SWEET RENDER: Metal plugin %s selected (%s)\n",plugin,mtl==1?"sweetmtl=1":"default");
++ } else IOLog("SWEET GLES: native A618 transport published; Metal discovery disabled for GLES boot\n");
++ provider->setProperty("model","Adreno 618");
++ provider->setProperty("NativeAdrenoABI",NativeAdrenoAbiVersion,32);
++ int extra=3;PE_parse_boot_argn("sweetm2extra",&extra,sizeof(extra));
++ backend.extra_slots=extra<0?0u:(extra>3?3u:(unsigned)extra);
++ int import_sync=0;PE_parse_boot_argn("sweetimportsync",&import_sync,sizeof(import_sync));
++ native_adreno_import_sync=import_sync!=0;
++ uint32_t below_kib=2048;PE_parse_boot_argn("sweetimportmin",&below_kib,sizeof(below_kib));
++ native_adreno_import_sync_below=(uint64_t)below_kib<<10;
++ IOLog("SWEET RENDER: imported BO cache sync by %s (sweetimportsync=%d), kernel still maintains imports below %u KiB\n",
++   import_sync?"kernel at every submit/completion":"client per command",import_sync,below_kib);
++ int swap_fence=0;PE_parse_boot_argn("sweetpresentfence",&swap_fence,sizeof(swap_fence));
++ backend.present_swap_fence=swap_fence!=0;
++ int present_locked=0;PE_parse_boot_argn("sweetpresentlock",&present_locked,sizeof(present_locked));
++ backend.present_locked=present_locked!=0;
++ int pipeline=1;PE_parse_boot_argn("sweetpipeline",&pipeline,sizeof(pipeline));
++ backend.pipeline=pipeline!=0;
++ int wait_locked=0;PE_parse_boot_argn("sweetwaitlock",&wait_locked,sizeof(wait_locked));
++ backend.wait_unlocked=wait_locked==0;
++ IOLog("SWEET RENDER: fence waits %s (sweetwaitlock=%d)\n",
++   backend.wait_unlocked?"poll with the lock dropped between checks":"spin under the lock",wait_locked);
++ IOLog("SWEET RENDER: submission pipelining %s (BoFree/close still drain); extra Metal slots=%u\n",
++   backend.pipeline?"enabled":"disabled",backend.extra_slots);
++ int present_wait=0;PE_parse_boot_argn("sweetpresentwait",&present_wait,sizeof(present_wait));
++ backend.cpu_present=mtl==2 && gles!=1 && present_wait==1;
++ __atomic_store_n(&presentation_ready,true,__ATOMIC_RELEASE);
++ if(backend.cpu_present)IOLog("SWEET RENDER: CPU presentation fence gate enabled\n");
++ backend.published=true;provider->registerService();
++ IOLog("SWEET RENDER: NativeAdreno ABI + Metal discovery published on live A618 context\n");
++ /* Metal.framework probes IOAcceleratorES once, when backboardd initializes
++    CoreAnimation, long before this asynchronous bring-up publishes the
++    service. Restart it once here (Sunfish's install script does the same by
++    hand) so the fresh process finds MetalPluginName. */
++ int restart=1;PE_parse_boot_argn("sweetm2restart",&restart,sizeof(restart));
++ if(gles!=1 && restart==1) {
++  for(int pid=1;pid<99999;pid++) {
++   proc_t p=proc_find(pid);
++   if(!p)continue;
++   const bool match=!strcmp(proc_best_name(p),"backboardd");
++   if(match)proc_signal(pid,SIGKILL);
++   proc_rele(p);
++   if(match) {
++    IOLog("SWEET RENDER: restarted backboardd for Metal discovery\n");
++    break;
++   }
++  }
++ }
++ return 0;
++}
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoRender.cpp b/iokit/Kernel/arm/SweetNativeAdrenoRender.cpp
+new file mode 100644
+index 0000000..35cfdde
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNativeAdrenoRender.cpp
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: MIT
++ * A618 render-engine setup from pinned SM7150 a6xx_gpu/catalog/XML and
++ * qcom_ubwc_cfg_data sm7150_data. Does not reset the working CP or GMU.
++ */
++#include <IOKit/IOLib.h>
++#include "unixnu/NativeAdrenoABI.h"
++extern "C" int sweet_native_adreno_render_profile(uintptr_t mapping,NativeAdrenoAbiDeviceInfo *info)
++{
++ if(!mapping || !info)return 1;
++ auto core=reinterpret_cast<volatile uint32_t *>(mapping);
++ /* Call only after the boot timestamp fence: no render IB is published yet.
++  * CP_PROTECT, SQE, trusted range and UCHE trap already have the proven boot
++  * values. Complete the previously missing 3D blocks and GMEM/UBWC layout. */
++ static const struct {unsigned reg,value,mask;} setup[]={
++  {0x0c01,1,1}, {0x8601,1,1}, {0x8e05,1,1}, {0x9e01,1,1},
++  {0xbe05,1,1}, {0xa601,1,1}, {0x9601,1,1}, {0xae01,1,1}, {0xb601,1,1},
++  {0x050b,0xffffffff,0}, {0x0500,1,1},
++  {0x0e0b,0x100000,0xffffffff}, {0x0e0c,0,0xffffffff},
++  /* A618 log0111: MAX reads 0x17f000 after Linux's 0x17ffff write.
++   * The inclusive limit's low 12 bits are RAZ; validate the page address.
++   * Keep Linux's inclusive-end programming and check all upper bits. */
++  {0x0e0d,0x17ffff,0xfffff000}, {0x0e0e,0,0xffffffff},
++  {0x9e00,0x00180000,0x00180000},
++  /* UBWC2: bank14 (hbb_lo1), min32B, four channels, levels2+3 swizzle. */
++  {0x8e08,2,0xffffffff}, {0xb604,2,0xffffffff}, {0xae02,2,0xffffffff},
++  {0x0e01,1u<<21,(1u<<23)|(3u<<21)},
++  /* Downstream A618 a6xx_start programs UCHE_CLIENT_PF=1. The XML calls
++   * this field PERFSEL, not a render-enable bit. On sweet0114 bit7 read
++   * zero after the generic mainline0x81 write. Use the vendor selector
++   * and validate its entire8-bit field instead of gating on that bit. */
++  {0x0e19,1,0xff},
++  /* A618 has no eight-channel macrotiling override. Downstream a6xx_start
++   * accesses RBBM_NC_MODE_CNTL only for channel==8. Preserve its reset
++   * setting here; 0112 hardware reads 0xdeafbead from 0x534. */
++ };
++ for(const auto &entry:setup) {
++  core[entry.reg]=entry.value;
++  __asm__ volatile("dsb sy":::"memory");
++  const uint32_t value=core[entry.reg];
++  if(value==0xdeafbead || (value==UINT32_MAX && entry.value!=UINT32_MAX)) {
++   IOLog("SWEET RENDER: invalid readback reg=%#x value=%#x\n",entry.reg,value);return 1;
++  }
++  if((value&entry.mask)!=(entry.value&entry.mask)) {
++   IOLog("SWEET RENDER: reg=%#x expected=%#x read=%#x\n",entry.reg,entry.value,value);return 1;
++  }
++ }
++ if(core[0x084f]!=0xb || core[0x0e09]!=0xfffff000 || core[0x0e0a]!=0x1ffff)return 1;
++ *info={0x06010800,512u*1024u,0x100000,UINT64_C(0x1fffffffff000),
++     UINT64_C(0x40000000),UINT64_C(0x30000000),14,6,0,2,NativeAdrenoDeviceClientIova,0};
++ IOLog("SWEET RENDER: A618 PERFSEL legacy selector=1 accepted\n");
++ IOLog("SWEET RENDER: A618 address modes/GMEM512K/UBWC2 programmed and read back\n");
++ return 0;
++}
+diff --git a/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+new file mode 100644
+index 0000000..6095c21
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNativeAdrenoVM.cpp
+@@ -0,0 +1,206 @@
++/* SPDX-License-Identifier: MIT
++ * sweet/A618 live BO arena. Called before SQE release, under the boot GPU
++ * owner's lease. Never replaces an enabled CB0 or touches GMU CB1.
++ */
++#include <IOKit/IOLib.h>
++#include <sys/errno.h>
++#include "../../../bsd/dev/sweet_adreno_cp.h"
++#include "unixnu/NativeAdrenoVm.h"
++#include "unixnu/NativeAdrenoSubmit.h"
++#include "unixnu/NativeAdrenoABI.h"
++extern "C" int sweet_native_adreno_render_profile(uintptr_t,NativeAdrenoAbiDeviceInfo *);
++extern "C" volatile uint32_t native_adreno_force_wb;
++extern "C" int sweet_native_adreno_publish(NativeAdrenoVm *,NativeAdrenoSubmit *,NativeAdrenoRing *,IOLock *,
++    const NativeAdrenoRingClock *,int (*)(void *),int (*)(void *,uint32_t,uint32_t *),const NativeAdrenoAbiDeviceInfo *);
++
++namespace {
++constexpr unsigned PollBudget=100000, TableBytes=0x404000;
++constexpr uint64_t ArenaStart=0x40000000, ArenaBytes=0x80000000;
++struct BootVm {
++ NativeAdrenoMemory tables,firmware,ring,fence;
++ NativeAdrenoVm vm;
++ NativeAdrenoSubmit submit;
++ ArmSmmu4KLiveArena arena{};
++ ArmSmmu4KLiveState live{};
++ ArmSmmu4KLiveVisibility visibility{};
++ ArmSmmu4KContextConfig config{};
++ ArmSmmu4KStreamState streams{};
++ ArmSmmu4KIo io{};
++ a618_smmu_io hardware{};
++ uint64_t handles[3]{};
++ bool attempted=false,ready=false,connected=false,faultWriteQuirk=false;
++} state;
++int read32(void *,size_t offset,uint32_t *value)
++{
++ if(!value || (offset&3) || offset>0xfffc)return 1;
++ *value=state.hardware.registers.read(state.hardware.registers.cookie,(uint32_t)offset);
++ return *value==UINT32_MAX;
++}
++int read64(void *,size_t offset,uint64_t *value)
++{
++ if(!value || (offset&7) || offset>0xfff8)return 1;
++ *value=state.hardware.read64(state.hardware.registers.cookie,(uint32_t)offset);
++ return *value==UINT64_MAX;
++}
++int write32(void *,size_t offset,uint32_t value)
++{
++ /* Restrict the helper to its leased CB0 and one stream slot. The SMMU
++  * core does no global writes, and never accesses the GMU context bank. */
++ const unsigned slot=state.streams.streams[0].slot;
++ if((offset&3) || !((offset>=0x8000 && offset<=0x8ffc) || offset==0x1000 ||
++     offset==0x1800 || offset==0x800+4*slot || offset==0xc00+4*slot))return 1;
++ /* Qualcomm firmware can ignore FAULT writes and rewrite BYPASS to FAULT.
++  * This flag is probed ONLY while our exact leased SMR is still invalid.
++  * Never request a real bypass stream or change the GMU route. */
++ if(offset==0xc00+4*slot && value==(2u<<16) && state.faultWriteQuirk)value=(1u<<16)|0xffu;
++ state.hardware.registers.write(state.hardware.registers.cookie,(uint32_t)offset,value);
++ return 0;
++}
++int write64(void *,size_t offset,uint64_t value)
++{
++ if((offset&7) || offset<0x8000 || offset>0x8ff8)return 1;
++ state.hardware.write64(state.hardware.registers.cookie,(uint32_t)offset,value);
++ return 0;
++}
++int barrier(void *)
++{state.hardware.barrier(state.hardware.registers.cookie);return 0;}
++int failed(const char *where,IOReturn error)
++{
++ /* All descriptor and VM storage is retained on an uncertain failure. There
++  * is no fallback that clears active tables or restarts an already-run SQE. */
++ IOLog("SWEET NATIVE VM: %s failed=%#x; all resources retained\n",where,error);
++ state.ready=false;return EIO;
++}
++int translate(uint64_t iova,uint64_t *physical)
++{
++ if(write64(nullptr,0x8800,iova) || barrier(nullptr))return EIO;
++ for(unsigned i=0;i<1000;++i) {
++  uint32_t status=0;
++  if(read32(nullptr,0x88f0,&status))return EIO;
++  if(!(status&1))return read64(nullptr,0x8050,physical)?EIO:0;
++  state.hardware.registers.delay_us(state.hardware.registers.cookie,1);
++ }
++ return ETIMEDOUT;
++}
++}
++extern "C" int sweet_native_adreno_prepare_vm(const a618_smmu_io *hardware,
++    const a618_dma_region *memory,a618_smmu_result *result)
++{
++ if(!hardware || !memory || !result || !hardware->registers.read || !hardware->registers.write ||
++    !hardware->registers.delay_us || !hardware->read64 || !hardware->write64 || !hardware->barrier ||
++    !memory->cpu || !memory->uncached || memory->bytes!=A618_CP_DMA_BYTES ||
++    (memory->physical&0x3fff) || memory->physical>=(UINT64_C(1)<<36) ||
++    memory->bytes>(UINT64_C(1)<<36)-memory->physical)return EINVAL;
++ if(state.attempted)return EBUSY;
++ state.attempted=true;state.hardware=*hardware;*result={};result->slot=UINT32_MAX;
++ state.io={nullptr,0x10000,read32,read64,write32,write64,barrier,1};
++ uint32_t id0=0,id1=0,id2=0,control=0,sctlr=0,fsr=0;
++ if(read32(nullptr,0x20,&id0) || read32(nullptr,0x24,&id1) || read32(nullptr,0x28,&id2) ||
++    read32(nullptr,0,&control) || read32(nullptr,0x8000,&sctlr) || read32(nullptr,0x8058,&fsr))return EIO;
++ if(fsr&(1u<<30))return EBUSY;
++ if(id0!=0x48016605 || id1!=0x20008005 || id2!=0x7511 || (sctlr&1))return ENOTSUP;
++ /* Claim only an invalid slot. An active SID0 or any live CB0 route is a
++  * foreign owner, regardless of its apparent idle state. */
++ unsigned slot=UINT32_MAX;
++ for(unsigned i=0;i<5;++i) {
++  uint32_t smr=0,s2cr=0;
++  if(read32(nullptr,0x800+4*i,&smr) || read32(nullptr,0xc00+4*i,&s2cr))return EIO;
++  if(smr&(1u<<31)) {
++   const uint32_t mask=(smr>>16)&0x7fff;
++   if(((smr&0xffff)&~mask)==0 || (!(s2cr&(3u<<16)) && !(s2cr&255)))return EBUSY;
++  } else if(slot==UINT32_MAX)slot=i;
++ }
++ if(slot==UINT32_MAX)return ENOSPC;
++ result->slot=slot;result->context=0;result->control=control;
++ /* The boot GMU owner has already established enable/fault-on-unmatched,
++  * with global IRQ disabled. Preserve that policy and every other route. */
++ if((control&0x407)!=0x402)return ENOTSUP;
++ state.streams.streams[0]={slot,0};
++ /* Pinned Linux qcom_smmu_cfg_probe/qcom_smmu_write_s2cr quirk.
++  * Probe the claimed INVALID slot: global USFCFG faults unmatched traffic,
++  * and no valid SID or enabled CB0 exists here. Do not probe any live route. */
++ uint32_t invalidSmr=0,probe=0,faulted=0;
++ if(read32(nullptr,0x800+4*slot,&invalidSmr) || (invalidSmr&(1u<<31)))return EBUSY;
++ if(write32(nullptr,0xc00+4*slot,(1u<<16)|0xffu) || barrier(nullptr) ||
++    read32(nullptr,0xc00+4*slot,&probe))return EIO;
++ if((probe&~0xffu)==(2u<<16))state.faultWriteQuirk=true;
++ else if(probe!=((1u<<16)|0xffu))return failed("S2CR quirk probe",kIOReturnIOError);
++ if(write32(nullptr,0xc00+4*slot,2u<<16) || barrier(nullptr) ||
++    read32(nullptr,0xc00+4*slot,&faulted) || (faulted&~0xffu)!=(2u<<16))
++  return failed("S2CR fault readback",kIOReturnIOError);
++ IOLog("SWEET NATIVE VM: leased slot=%u S2CR probe=%#x fault=%#x qcom_quirk=%u\n",
++     slot,probe,faulted,(unsigned)state.faultWriteQuirk);
++ const ArmSmmu4KStream stream={slot,0};ArmSmmu4KStreamResult routes{};
++ ArmSmmu4KStatus status=ArmSmmu4KCheckFaultedStreams(&state.io,&stream,1,0,&routes);
++ if(status) {
++  IOLog("SWEET NATIVE VM: route detail ID0=%#x sCR0=%#x GFSR=%#x verified=%u SMR=%#x S2CR=%#x\n",
++      routes.id0,routes.scr0,routes.global_fault,routes.streams_verified,invalidSmr,faulted);
++  return failed("route preflight",(IOReturn)status);
++ }
++ IOReturn error=state.tables.allocate(TableBytes,36,true,8u*1024u*1024u);
++ if(error)return failed("table allocation",error);
++ error=NativeAdrenoPrepareSmmuMemory(&state.tables,32,36,ArenaStart,ArenaBytes,0,
++     ArenaBytes/4096,&state.arena,&state.live,&state.visibility);
++ if(error)return failed("table preparation",error);
++ uint32_t wb=0;
++ PE_parse_boot_argn("sweetgpuwb",&wb,sizeof(wb));
++ native_adreno_force_wb=wb?1:0;
++ printf("SWEET ADRENO: GPU mappings %s (sweetgpuwb=%u)\n",wb?"forced write-back":"as the client asks",wb);
++ uint32_t walk=0;
++ PE_parse_boot_argn("sweetsmmuwalk",&walk,sizeof(walk));
++ printf("SWEET ADRENO: GPU SMMU table walks %s (sweetsmmuwalk=%u)\n",walk?"cacheable (inner WBWA)":"outer non-cacheable",walk);
++ state.config={&state.arena.config,nullptr,&state.live.tables,nullptr,id0,id2,0x62,walk?1u:0u,0,1,1};
++ ArmSmmu4KProgramResult programmed{};
++ status=ArmSmmu4KProgramDisabledContext(&state.io,0,&state.config,PollBudget,&programmed);
++ if(status)return failed("context programming",(IOReturn)status);
++ status=ArmSmmu4KAttachStreams(&state.io,&state.streams,&stream,1,0,&state.config,&routes);
++ if(status)return failed("stream attachment",(IOReturn)status);
++ NativeAdrenoVmRegion region={&state.tables,&state.arena,&state.live};
++ error=state.vm.attach(&state.io,&state.config,&state.streams,&region,nullptr,65536,PollBudget);
++ if(error)return failed("VM attachment",error);
++ NativeAdrenoMemory *objects[]={&state.firmware,&state.ring,&state.fence};
++ const unsigned offsets[]={A618_CP_SQE_OFFSET,A618_CP_RING_OFFSET,A618_CP_FENCE_OFFSET};
++ const unsigned sizes[]={0x8000,0x8000,0x4000};
++ const uint64_t addresses[]={A618_CP_IOVA,A618_CP_RING_IOVA,A618_CP_FENCE_IOVA};
++ for(unsigned i=0;i<3;++i) {
++  error=objects[i]->borrowBootStorage(memory->cpu+offsets[i],memory->physical+offsets[i],sizes[i],36);
++  if(!error)error=state.vm.map(objects[i],0,addresses[i],ArmSmmu4KRead|
++      (i?ArmSmmu4KWrite:ArmSmmu4KExecute),0,2,&state.handles[i]);
++  if(error)return failed("bootstrap mapping",error);
++ }
++ /* Prove real translations for the unchanged firmware/ring/fence IOVAs,
++  * including the immediately following unmapped guard, before SQE starts. */
++ for(unsigned i=0;i<=20;++i) {
++  uint64_t translated=0;
++  const int failure=translate(A618_CP_IOVA+4096ull*i,&translated);
++  result->par=translated;
++  if(failure)return failure;
++  if(i==20) {if(!(translated&1))return EFAULT;}
++  else {
++   const uint64_t expected=memory->physical+A618_CP_SQE_OFFSET+4096ull*i;
++   if((translated&1) || (translated&UINT64_C(0xffffff000))!=expected)return EFAULT;
++   ++result->translated;
++  }
++ }
++ if(read32(nullptr,0x8058,&result->fault) || (result->fault&0xc00001feu))return EIO;
++ result->offset=0x800+4*slot;
++ if(read32(nullptr,result->offset,&result->value))return EIO;
++ state.ready=true;
++ IOLog("SWEET NATIVE VM: CB0 active ASID62 4K GPU /16K host, aperture=%#llx+%#llx tablePA=%#llx pages=%lu bootstrap=%u\n",
++     ArenaStart,ArenaBytes,state.tables.spans()[0].physical,state.live.tables.table_pages,result->translated);
++ return 0;
++}
++extern "C" int sweet_native_adreno_connect_vm(NativeAdrenoRing *ring,IOLock *gate,const NativeAdrenoRingClock *clock,
++    uintptr_t core,int (*health)(void *),int (*read)(void *,uint32_t,uint32_t *))
++{
++ if(!state.ready || state.connected || !ring)return ENXIO;
++ const IOReturn error=state.submit.attach(&state.vm,ring);
++ if(error)return failed("submit attachment",error);
++ NativeAdrenoAbiDeviceInfo info{};
++ if(sweet_native_adreno_render_profile(core,&info))return failed("render profile",kIOReturnIOError);
++ if(sweet_native_adreno_publish(&state.vm,&state.submit,ring,gate,clock,health,read,&info))
++  return failed("userclient publication",kIOReturnIOError);
++ state.connected=true;
++ IOLog("SWEET NATIVE VM: live BO/IB manager connected to compositor userclient\n");
++ return 0;
++}
