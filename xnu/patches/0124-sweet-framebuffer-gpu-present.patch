@@ -1,0 +1,1369 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 93fc0a2..8da5aac 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -845,6 +846,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_gpu_probe();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..7d0d41b 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -182,6 +182,8 @@ sweet_usb_probe(void)
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
+ 
+@@ -228,6 +230,10 @@ static struct {
+ 	bool        data_in;        /* data stage direction */
+ 	uint32_t    events;
+ 	bool        configured;
++	bool        data_failed;
++	uint8_t     resource[6]; /* active data transfer resource index */
++	uint32_t    configuration_epoch;
++	uint64_t    epoch_rx_start;
+ 	uint8_t     data_alt;       /* data interface alternate setting */
+ 	/* network */
+ 	ifnet_t     ifp;
+@@ -281,6 +287,9 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+ 				return -1;
+ 			}
++			if (ep > 1 && ep < 6 && (cmd & 0xf) == DEPCMD_STARTTRANSFER) {
++				ud.resource[ep] = (uint8_t)((v >> 16) & 0x7f);
++			}
+ 			return 0;
+ 		}
+ 		delay(1);
+@@ -392,11 +401,44 @@ ud_notify_connected(void)
+ 	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
+ }
+ 
++/* Called on the event thread, serialized against network output. End active
++ * transfers before reusing their permanent DMA storage, as Linux DWC3 does on
++ * reset. No IOC: allow the documented 1 ms settling time after EndTransfer.
++ * A command failure keeps the data path disabled until the next kernel boot. */
++static void
++ud_reset_data(void)
++{
++ lck_mtx_lock(ud.lock);
++ ud.configured = false;
++ ud.data_alt = 0;
++ static const unsigned endpoints[] = { EP_RX, EP_TX, EP_INT };
++ for (unsigned i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
++  unsigned ep = endpoints[i];
++  if (ud.resource[ep]) {
++   if (ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM |
++       ((uint32_t)ud.resource[ep] << 16), 0, 0, 0)) ud.data_failed = true;
++   delay(1000);
++   ud.resource[ep] = 0;
++  }
++ }
++ dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++ while (ud.txq_count) {
++  mbuf_freem(ud.txq[ud.txq_head]);
++  ud.txq[ud.txq_head] = NULL;
++  ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++  ud.txq_count--;
++ }
++ ud.tx_busy = false;
++ lck_mtx_unlock(ud.lock);
++}
++
+ /* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
+ static void
+ ud_configure(void)
+ {
+-	if (ud.configured) {
++	lck_mtx_lock(ud.lock);
++	if (ud.configured || ud.data_failed) {
++		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+@@ -408,11 +450,16 @@ ud_configure(void)
+ 	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
+ 	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+ 		printf("SWEET USB: data endpoints setup failed\n");
++		ud.data_failed = true;
++		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	ud.epoch_rx_start = ud.rx_frames;
++	ud.configuration_epoch++;
+ 	ud.configured = true;
+ 	ud_rx_arm();
++	lck_mtx_unlock(ud.lock);
+ 	printf("SWEET USB: ECM endpoints configured\n");
+ }
+ 
+@@ -448,6 +495,11 @@ ud_setup(void)
+ 	} else if (req == 9) {          /* SET_CONFIGURATION */
+ 		if (value == 1) {
+ 			ud_configure();
++			ok = ud.configured;
++		} else if (value == 0) {
++			ud_reset_data();
++		} else {
++			ok = false;
+ 		}
+ 		printf("SWEET USB: configured (%u)\n", value);
+ 	} else if (req == 8) {          /* GET_CONFIGURATION */
+@@ -456,10 +508,17 @@ ud_setup(void)
+ 		data[0] = 0; data[1] = 0; n = 2;
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+ 		if (index == 1) {
+-			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
+-				ud_notify_connected();
+-				ud_link_event(true);
++			if (value > 1) {
++				ok = false;
++			} else {
++				lck_mtx_lock(ud.lock);
++				ud.data_alt = (uint8_t)value;
++				if (value == 1 && ud.configured) {
++					ud_notify_connected();
++					ud_link_event(true);
++					ud_tx_kick_locked();
++				}
++				lck_mtx_unlock(ud.lock);
++			}
+-			}
+ 		}
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+@@ -523,7 +583,9 @@ ud_rx_done(void)
+ 			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
+ 			stats.packets_in = 1;
+ 			stats.bytes_in = len;
++			lck_mtx_lock(ud.lock);
+ 			ud.rx_frames++;
++			lck_mtx_unlock(ud.lock);
+ 			ifnet_input(ud.ifp, m, &stats);
+ 		} else if (m != NULL) {
+ 			mbuf_freem(m);
+@@ -536,7 +598,7 @@ ud_rx_done(void)
+ static void
+ ud_tx_kick_locked(void)
+ {
+-	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
++	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured && ud.data_alt == 1) {
+ 		mbuf_t m = ud.txq[ud.txq_head];
+ 		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+ 		ud.txq_count--;
+@@ -710,6 +772,7 @@ ud_event(uint32_t ev)
+ 	if (ev & 1) {                   /* device event */
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
++			ud_reset_data();
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("SWEET USB: bus reset\n");
+ 		} else if (type == 2) { /* connect done */
+@@ -721,6 +784,7 @@ ud_event(uint32_t ev)
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
++			ud_reset_data();
+ 			printf("SWEET USB: disconnect\n");
+ 		}
+ 		return;
+@@ -730,16 +794,19 @@ ud_event(uint32_t ev)
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
+ 	if (ep == EP_RX && type == 1) {
+-		ud_rx_done();
++		ud.resource[EP_RX] = 0;
++		if (ud.configured) ud_rx_done();
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+ 		lck_mtx_lock(ud.lock);
++		ud.resource[EP_TX] = 0;
+ 		ud.tx_busy = false;
+ 		ud_tx_kick_locked();
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
++	if (ep == EP_INT && type == 1) ud.resource[EP_INT] = 0;
+ 	if (ep > 1) {
+ 		return;
+ 	}
+@@ -817,6 +884,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
++	uint32_t epoch = 0;
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
+ 	bzero(&to, sizeof(to));
+@@ -826,22 +894,33 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+-		if (!ud.configured) {
+-			continue;
+-		}
++		lck_mtx_lock(ud.lock);
++  bool ready = ud.configured && ud.data_alt == 1 && ud.rx_frames > ud.epoch_rx_start;
++  uint32_t current_epoch = ud.configuration_epoch;
++  lck_mtx_unlock(ud.lock);
++  if (!ready) continue;
++  if (epoch != current_epoch) {
++   pos = sweet_log_position();
++   pos = pos > 1048576 ? pos - 1048576 : 0;
++   epoch = current_epoch;
++  }
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+ 		}
+ 		uint32_t n;
+-		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
++		for (unsigned budget = 0; budget < 16; budget++) {
++			uint64_t before = pos;
++			n = sweet_log_copy(&pos, chunk, sizeof(chunk));
++			if (!n) break;
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+ 				.msg_name = &to, .msg_namelen = sizeof(to),
+ 				.msg_iov = &iov, .msg_iovlen = 1,
+ 			};
+ 			size_t sent = 0;
+-			if (sock_send(so, &msg, 0, &sent) != 0) {
++			if (sock_send(so, &msg, 0, &sent) != 0 || sent != n) {
++				pos = before;
+ 				break;          /* no route/ARP yet: retry later */
+ 			}
+ 		}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..21d0738 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -445,6 +445,28 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Fixed, compositor-only GLES bootstrap. Inactive on ordinary Metal boots. */
++static int
++sweet_gles_exec_env(struct image_params *imgp, int ptr_size)
++{
++    int enabled=0;
++    if (!PE_parse_boot_argn("sweetgles", &enabled, sizeof(enabled)) || enabled!=1) return 0;
++    const char *path=imgp->ip_strings+strlen("executable_path="), *base=path;
++    for (const char *c=path; *c; ++c) if (*c=='/') base=c+1;
++    if (strcmp(base,"backboardd")) return 0;
++    if (imgp->ip_argspace<ptr_size) return E2BIG;
++    static const char env[]="DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib";
++    int error=exec_add_user_string(imgp,CAST_USER_ADDR_T(env),UIO_SYSSPACE,TRUE);
++    if (error) return error;
++    if (imgp->ip_argspace<ptr_size) return E2BIG;
++    imgp->ip_argspace-=ptr_size;
++    imgp->ip_envc++;
++    printf("SWEET GLES: backboardd will load /usr/lib/sweetgl.dylib\n");
++    return 0;
++}
++#endif
++
+ /*
+  * dyld is now passed the executable path as a getenv-like variable
+  * in the same fashion as the stack_guard and malloc_entropy keys.
+@@ -5741,6 +5763,11 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++    error=sweet_gles_exec_env(imgp,new_ptr_size);
++    if (error) goto bad;
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6e4179e..511ce17 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,7 @@
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
++ * scaling, CPU copy). Vsync (notification type 5) is a software timer up to 120 Hz that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -48,10 +48,34 @@ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBus
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
+ #include <sys/proc.h>
++#include "SweetIOAccelerator.h"
++#include "unixnu/NativeAdrenoMemory.h"
++extern "C" int sweet_native_adreno_cpu_present_begin(uint32_t swap_fence);
++extern "C" uint32_t sweet_native_adreno_last_fence(void);
++extern "C" void sweet_native_adreno_cpu_present_end(int state);
++extern "C" void sweet_native_adreno_sample_busy(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/* MDP INTF timing engines (sweet DT qcom,sde-intf-off 0x6b000.. from
++ * mdp_phys 0xae00000; types dp,dsi,dsi,dp). Register layout as Linux
++ * dpu_hw_intf.c. Only read, except FRAME_LINE_COUNT_EN which the downstream
++ * driver itself sets to 3 when it programs a timing engine. */
++#define SWEET_INTF_PA           0x0ae6b000ULL
++#define INTF_TIMING_ENGINE_EN   0x000
++#define INTF_HSYNC_CTL          0x008
++#define INTF_VSYNC_PERIOD_F0    0x00c
++#define INTF_DISPLAY_V_START_F0 0x01c
++#define INTF_DISPLAY_V_END_F0   0x024
++#define INTF_FRAME_LINE_COUNT_EN 0x0a8
++#define INTF_FRAME_COUNT        0x0ac
++#define INTF_LINE_COUNT         0x0b0
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -70,7 +94,7 @@ enum {
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+-#define SWEET_FB_VSYNC_US               16667
++#define SWEET_FB_MAX_HZ                 120u
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -92,6 +116,38 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
++/*
++ * Real panel brightness for the Xiaomi K6 38/0c/0a AMOLED (live FDT:
++ * bl_ctrl_dcs, levels 8..2047, DCS long write 0x51 hi lo in LP mode, sw DMA
++ * trigger). The ABL leaves DSI0 (0xae94000, dsi-ctrl-hw-v2.3) streaming in
++ * video mode. A command is queued through the controller's TPG DMA FIFO
++ * exactly as the downstream SM6150 dsi_ctrl_hw_cmn_kickoff_fifo_command():
++ * no memory fetch, so no display-SMMU mapping is involved; the command engine
++ * is enabled only for the transfer, and embedded mode sends it in blanking.
++ *
++ * iOS finds the backlight by IOPropertyMatch {backlight-control: true}
++ * (CoreBrightness BLControl, PowerLog AppleARMBacklight) and reads
++ * IODisplayParameters/brightness/{min,max,value}. setProperties() accepts
++ * brightness as a number or {value}, top level or inside IODisplayParameters,
++ * or BrightnessMilliNits, and logs what userland actually sent.
++ * sweetbl=N (8..2047) sends one level after start, as a hardware check.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++	volatile uint32_t *fDsi;
++	IOLock        *fLock;
++	thread_call_t  fCall;
++	uint32_t       fWanted, fSent, fValue, fFailures;
++	unsigned       fLogged;
++	static void    applyCall(thread_call_param_t owner, thread_call_param_t);
++	int            sendLevel(uint32_t level);
++	void           publish(void);
++	void           request(uint32_t level, uint32_t value);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -100,6 +156,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void presentThread(void *arg, wait_result_t result);
++	void requestPresent(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -115,7 +173,30 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+-	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	uint32_t      fPresentHz, fTimerHz, fPresentPhase;
++	uint64_t      fVsyncPeriod, fNextVsync;
++	uint64_t      fStatsStart, fStatsCallbacks, fStatsPresents, fStatsMissed;
++	/* The present thread owns copying; vsync only requests it. */
++	IOLock       *fPresentLock;
++	bool          fPresentRequested;
++	bool          fPresentThreaded;       /* sweetfb_thread=0: present inline on the vsync tick */
++	uint8_t       fPresentRec[SWEET_FB_SWAP_REC_SIZE];
++	uint64_t      fStatsPresentUs, fStatsPresentMaxUs, fStatsCoalesced;
++	/* 0131 hardware: presents averaged 15-66ms (max 247ms) once submits were
++	 * cheap; split them so the remaining cap is measured. */
++	uint64_t      fStatsGateUs, fStatsAcquireUs, fStatsCopyUs, fStatsSwaps;
++	uint32_t      fPendingFence, fPresentFence;   /* newest GPU fence when SwapEnd recorded the frame */
++	/* Beam-raced copy (0144): the DSC video-mode panel scans this single
++	 * buffer continuously, so a copy that starts behind the scan line tears
++	 * where it overtakes it. Start only where the copy cannot catch up. */
++	volatile uint32_t *fIntf;       /* the active INTF timing engine */
++	bool          fBeam, fBeamProbed;
++	uint32_t      fBeamTotal, fBeamFirst, fBeamLast;   /* lines: total, active first/last */
++	uint64_t      fBeamLineNs, fCopyRowNs;
++	uint64_t      fStatsBeamUs, fStatsBeamSkips;
++	void beamProbe(void);
++	void beamWait(uint32_t rows);
++	void rearmVsync(void);
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+@@ -128,17 +209,7 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+-/*
+- * The graphics accelerator's service class. QuartzCore (CAMetalContextCreate,
+- * once per process) polls IOServiceMatching("IOAcceleratorES") 300 times,
+- * 100 ms apart, before it goes on: thirty seconds at every backboardd start.
+- * One without MetalPluginName/MetalPluginClassName is found and then passed
+- * over by Metal (MTLRegisterDevices), which leaves the renderers as they were.
+- */
+-class IOAcceleratorES : public IOService {
+-	OSDeclareDefaultStructors(IOAcceleratorES);
+-};
+-
++/* The shared IOAcceleratorES meta-class lives in this translation unit. */
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -198,12 +269,25 @@ AppleCLCD::start(IOService *provider)
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	fPresentLock = IOLockAlloc();
++	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL || fPresentLock == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	int threaded = 1;
++	PE_parse_boot_argn("sweetfb_thread", &threaded, sizeof(threaded));
++	fPresentThreaded = threaded != 0;
++	if (fPresentThreaded) {
++		thread_t presenter = THREAD_NULL;
++		if (kernel_thread_start(&AppleCLCD::presentThread, this, &presenter) != KERN_SUCCESS) {
++			IOLog("SWEET FB: no present thread; presenting on the vsync tick\n");
++			fPresentThreaded = false;
++		} else {
++			thread_deallocate(presenter);
++		}
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -211,11 +295,31 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/* Preserve the legacy hz=0 meaning, and bound the experiment at 120 Hz. */
++	fPresentHz = hz == 0 ? 60u : (hz > SWEET_FB_MAX_HZ ? SWEET_FB_MAX_HZ : hz);
++	fTimerHz = fPresentHz > 60u ? fPresentHz : 60u;
++	fPresentPhase = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / fTimerHz, &fVsyncPeriod);
++	if (fVsyncPeriod == 0) {
++		return false;
++	}
++	fStatsStart = mach_absolute_time();
++	fStatsCallbacks = fStatsPresents = fStatsMissed = 0;
++	fStatsPresentUs = fStatsPresentMaxUs = fStatsCoalesced = 0;
++	fPresentRequested = false;
++	fNextVsync = fStatsStart + fVsyncPeriod;
++	fVsync->wakeAtTime(fNextVsync);
++	IOLog("SWEET FB: scheduler v3 requested=%u present=%u timer=%u Hz; present %s, software timing, panel mode unchanged\n",
++	    hz, fPresentHz, fTimerHz, fPresentThreaded ? "thread" : "inline");
+ 
+-	uint32_t accelOn = 1;
++	uint32_t accelOn = 1, gpuStage = 0;
+ 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
++	/* sweetgpu>=4 powers the Adreno and publishes the real IOAcceleratorES;
++	 * the empty placeholder must not race it. */
++	(void)PE_parse_boot_argn("sweetgpu", &gpuStage, sizeof(gpuStage));
++	if (gpuStage >= 4) {
++		accelOn = 0;
++	}
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
+@@ -241,15 +345,332 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	int backlight = 1;
++	PE_parse_boot_argn("sweetbacklight", &backlight, sizeof(backlight));
++	if (backlight) {
++		AppleARMBacklight *bl = new AppleARMBacklight;
++		if (bl == NULL || !bl->init() || !bl->attach(this) || !bl->start(this)) {
++			IOLog("SWEET BL: backlight service not started\n");
++			if (bl != NULL) {
++				bl->detach(this);
++				bl->release();
++			}
++		}
++	}
++	return true;
++}
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define SWEET_DSI0_PA           0x0ae94000ULL
++#define DSI_REG_CTRL            0x004
++#define DSI_REG_DMA_CTRL        0x03c
++#define DSI_REG_DMA_LENGTH      0x04c
++#define DSI_REG_ACK_ERR         0x068
++#define DSI_REG_DMA_TRIGGER     0x090
++#define DSI_REG_TIMEOUT_STATUS  0x0c0
++#define DSI_REG_INT_CTRL        0x110
++#define DSI_REG_TPG_CTRL        0x15c
++#define DSI_REG_TPG_DMA_DATA    0x17c
++#define DSI_REG_TPG_FIFO_RESET  0x1ec
++#define DSI_REG_VERSION         0x1f4
++#define SWEET_BL_MIN            8u
++#define SWEET_BL_MAX            2047u
++#define SWEET_BL_SCALE          65536u
++#define SWEET_BL_PEAK_MNITS     420000u   /* panel-peak-brightness 4200000 x 0.1 mnit */
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fCall = thread_call_allocate(&AppleARMBacklight::applyCall, this);
++	fDsi = (volatile uint32_t *)ml_io_map(SWEET_DSI0_PA, 0x400);
++	if (fLock == NULL || fCall == NULL || fDsi == NULL) {
++		return false;
++	}
++	const uint32_t ctrl = fDsi[DSI_REG_CTRL / 4], version = fDsi[DSI_REG_VERSION / 4];
++	IOLog("SWEET BL: DSI0 version=%#x ctrl=%#x dma_ctrl=%#x int=%#x\n", version, ctrl,
++	    fDsi[DSI_REG_DMA_CTRL / 4], fDsi[DSI_REG_INT_CTRL / 4]);
++	if ((ctrl & 3) != 3) {
++		IOLog("SWEET BL: DSI0 is not enabled in video mode; no backlight control\n");
++		return false;
++	}
++	/* The bootloader's level is not readable without a DCS read; report the
++	 * middle of the range until userland sets one. */
++	fValue = SWEET_BL_SCALE / 2;
++	fWanted = fSent = 0;
++	setName("backlight");
++	setProperty("backlight-control", true);
++	setProperty("DisplayStateControlSupported", false);
++	publish();
++	registerService();
++	IOLog("SWEET BL: AppleARMBacklight published (DCS 0x51, levels %u..%u)\n", SWEET_BL_MIN, SWEET_BL_MAX);
++	uint32_t test = 0;
++	if (PE_parse_boot_argn("sweetbl", &test, sizeof(test)) && test >= SWEET_BL_MIN && test <= SWEET_BL_MAX) {
++		request(test, (uint32_t)(((uint64_t)(test - SWEET_BL_MIN) * SWEET_BL_SCALE) / (SWEET_BL_MAX - SWEET_BL_MIN)));
++	}
+ 	return true;
+ }
+ 
++void
++AppleARMBacklight::publish(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSNumber *min = OSNumber::withNumber(0ULL, 32);
++	OSNumber *max = OSNumber::withNumber(SWEET_BL_SCALE, 32);
++	OSNumber *value = OSNumber::withNumber(fValue, 32);
++	if (params && brightness && min && max && value) {
++		brightness->setObject("min", min);
++		brightness->setObject("max", max);
++		brightness->setObject("value", value);
++		params->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(value);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(params);
++}
++
++static bool
++sweet_bl_number(OSObject *object, uint64_t *out)
++{
++	OSNumber *number = OSDynamicCast(OSNumber, object);
++	if (number == NULL) {
++		OSDictionary *dict = OSDynamicCast(OSDictionary, object);
++		number = dict != NULL ? OSDynamicCast(OSNumber, dict->getObject("value")) : NULL;
++	}
++	if (number == NULL) {
++		return false;
++	}
++	*out = number->unsigned64BitValue();
++	return true;
++}
++
++static void
++sweet_bl_log(const char *process, const char *prefix, OSDictionary *dict, int depth)
++{
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	if (it == NULL) {
++		return;
++	}
++	while (OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSObject *v = dict->getObject(key);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		OSDictionary *child = OSDynamicCast(OSDictionary, v);
++		IOLog("SWEET BL: %s set %s%s %s %llu bits=%u\n", process, prefix, key->getCStringNoCopy(),
++		    v ? v->getMetaClass()->getClassName() : "null", n ? n->unsigned64BitValue() : 0ULL,
++		    n ? n->numberOfBits() : 0);
++		if (child != NULL && depth < 2) {
++			char nested[64];
++			snprintf(nested, sizeof(nested), "%s%s.", prefix, key->getCStringNoCopy());
++			sweet_bl_log(process, nested, child, depth + 1);
++		}
++	}
++	it->release();
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (fLogged < 48) {
++		/* Record the exact keys and values CoreBrightness/backboardd use. */
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		sweet_bl_log(name, "", dict, 0);
++		++fLogged;
++	}
++	/* 0127 hardware: backboardd sends brightness-nits, brightness-nits-cap,
++	 * DisplayBrightness{...}, DisplayBrightnessSliderPosition, CompensationTweak. */
++	uint64_t nits = 0;
++	if (sweet_bl_number(dict->getObject("brightness-nits"), &nits) && nits) {
++		/* CoreBrightness sends nits * 65536 (IOFixed SInt32), as Bergamota 0249
++		 * also measured on iOS 18; a negative value means off. */
++		if (nits & 0x80000000ULL) {
++			nits = 0;
++		}
++		const uint64_t mnits = ((nits & 0xffffffffULL) * 1000) >> 16;
++		const uint64_t clamped = mnits > SWEET_BL_PEAK_MNITS ? SWEET_BL_PEAK_MNITS : mnits;
++		const uint32_t level = SWEET_BL_MIN + (uint32_t)((clamped * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_PEAK_MNITS);
++		request(level, (uint32_t)((clamped * SWEET_BL_SCALE) / SWEET_BL_PEAK_MNITS));
++		return kIOReturnSuccess;
++	}
++	OSDictionary *display = OSDynamicCast(OSDictionary, dict->getObject("DisplayBrightness"));
++	uint64_t position = 0;
++	if (display != NULL && (sweet_bl_number(display->getObject("value"), &position) ||
++	    sweet_bl_number(display->getObject("brightness"), &position)) && position > 1) {
++		const uint64_t v = position > SWEET_BL_SCALE ? SWEET_BL_SCALE : position;
++		request(SWEET_BL_MIN + (uint32_t)((v * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_SCALE), (uint32_t)v);
++		return kIOReturnSuccess;
++	}
++	if (sweet_bl_number(dict->getObject("DisplayBrightnessSliderPosition"), &position) && position > 1) {
++		const uint64_t v = position > SWEET_BL_SCALE ? SWEET_BL_SCALE : position;
++		request(SWEET_BL_MIN + (uint32_t)((v * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_SCALE), (uint32_t)v);
++		return kIOReturnSuccess;
++	}
++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++	OSDictionary *source = params != NULL ? params : dict;
++	uint64_t value = 0;
++	if (sweet_bl_number(source->getObject("brightness"), &value)) {
++		if (value > SWEET_BL_SCALE) {
++			value = SWEET_BL_SCALE;
++		}
++		const uint32_t level = SWEET_BL_MIN + (uint32_t)((value * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_SCALE);
++		request(level, (uint32_t)value);
++		return kIOReturnSuccess;
++	}
++	if (sweet_bl_number(source->getObject("BrightnessMilliNits"), &value)) {
++		if (value > SWEET_BL_PEAK_MNITS) {
++			value = SWEET_BL_PEAK_MNITS;
++		}
++		const uint32_t level = SWEET_BL_MIN + (uint32_t)((value * (SWEET_BL_MAX - SWEET_BL_MIN)) / SWEET_BL_PEAK_MNITS);
++		request(level, (uint32_t)((value * SWEET_BL_SCALE) / SWEET_BL_PEAK_MNITS));
++		return kIOReturnSuccess;
++	}
++	return kIOReturnUnsupported;
++}
++
++/* Coalesce: only the newest level is sent, from thread context. */
++void
++AppleARMBacklight::request(uint32_t level, uint32_t value)
++{
++	IOLockLock(fLock);
++	fWanted = level;
++	fValue = value;
++	IOLockUnlock(fLock);
++	publish();
++	thread_call_enter(fCall);
++}
++
++void
++AppleARMBacklight::applyCall(thread_call_param_t owner, thread_call_param_t)
++{
++	AppleARMBacklight *bl = (AppleARMBacklight *)owner;
++	IOLockLock(bl->fLock);
++	const uint32_t level = bl->fWanted;
++	IOLockUnlock(bl->fLock);
++	if (level == 0 || level == bl->fSent || bl->fFailures >= 4) {
++		return;
++	}
++	const int error = bl->sendLevel(level);
++	if (error) {
++		++bl->fFailures;
++	} else {
++		bl->fSent = level;
++	}
++}
++
++int
++AppleARMBacklight::sendLevel(uint32_t level)
++{
++	volatile uint32_t *dsi = fDsi;
++	const uint32_t ctrl = dsi[DSI_REG_CTRL / 4];
++	if ((ctrl & 3) != 3) {
++		IOLog("SWEET BL: DSI0 left video mode (ctrl=%#x); level %u not sent\n", ctrl, level);
++		return ENODEV;
++	}
++	const uint32_t dma_ctrl = dsi[DSI_REG_DMA_CTRL / 4];
++	/* DCS long write: header {WC lsb, WC msb, data id 0x39, LAST|LONG}, then 0x51 hi lo, 0xff pad. */
++	const uint32_t words[2] = {
++		3u | (0x39u << 16) | (0xc0u << 24),
++		0x51u | ((level >> 8) << 8) | ((level & 0xff) << 16) | (0xffu << 24),
++	};
++	dsi[DSI_REG_CTRL / 4] = ctrl | (1u << 2);                       /* command engine on */
++	dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;    /* W1C stale DMA done */
++	dsi[DSI_REG_TPG_CTRL / 4] = (1u << 1) | (1u << 2) | (3u << 16);
++	dsi[DSI_REG_TPG_DMA_DATA / 4] = words[0];
++	dsi[DSI_REG_TPG_DMA_DATA / 4] = words[1];
++	dsi[DSI_REG_DMA_CTRL / 4] = (dma_ctrl & ~((1u << 31) | (1u << 30))) | (1u << 26) | (1u << 28);
++	dsi[DSI_REG_DMA_LENGTH / 4] = sizeof(words);
++	__asm__ volatile("dsb sy" ::: "memory");
++	dsi[DSI_REG_DMA_TRIGGER / 4] = 1;
++	unsigned us;
++	for (us = 0; us < 50000 && !(dsi[DSI_REG_INT_CTRL / 4] & 1u); us += 50) {
++		IODelay(50);
++	}
++	const bool done = (dsi[DSI_REG_INT_CTRL / 4] & 1u) != 0;
++	const uint32_t ack = dsi[DSI_REG_ACK_ERR / 4], timeout = dsi[DSI_REG_TIMEOUT_STATUS / 4];
++	if (done) {
++		dsi[DSI_REG_INT_CTRL / 4] = dsi[DSI_REG_INT_CTRL / 4] | 1u;
++	}
++	dsi[DSI_REG_TPG_CTRL / 4] = 0;
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 1;
++	IODelay(1);
++	dsi[DSI_REG_TPG_FIFO_RESET / 4] = 0;
++	dsi[DSI_REG_DMA_CTRL / 4] = dma_ctrl;
++	if (!(ctrl & (1u << 2))) {
++		dsi[DSI_REG_CTRL / 4] = dsi[DSI_REG_CTRL / 4] & ~(1u << 2);
++	}
++	static unsigned sent_logs = 0;
++	if (!done || sent_logs < 16) {
++		++sent_logs;
++		IOLog("SWEET BL: DCS 0x51 level %u %s after %u us ack_err=%#x timeout=%#x\n",
++		    level, done ? "sent" : "NOT acknowledged", us, ack, timeout);
++	}
++	return done ? 0 : ETIMEDOUT;
++}
++
++/* Advance on an absolute cadence. Skip missed slots instead of queuing bursts. */
++void
++AppleCLCD::rearmVsync(void)
++{
++	uint64_t now = mach_absolute_time();
++	fNextVsync += fVsyncPeriod;
++	if (fNextVsync <= now) {
++		uint64_t skipped = (now - fNextVsync) / fVsyncPeriod + 1;
++		fNextVsync += skipped * fVsyncPeriod;
++		fStatsMissed += skipped;
++	}
++	uint64_t elapsed;
++	absolutetime_to_nanoseconds(now - fStatsStart, &elapsed);
++	if (elapsed >= 10ULL * NSEC_PER_SEC) {
++		const uint64_t presents = __atomic_exchange_n(&fStatsPresents, 0, __ATOMIC_RELAXED);
++		const uint64_t present_us = __atomic_exchange_n(&fStatsPresentUs, 0, __ATOMIC_RELAXED);
++		const uint64_t present_max = __atomic_exchange_n(&fStatsPresentMaxUs, 0, __ATOMIC_RELAXED);
++		const uint64_t coalesced = __atomic_exchange_n(&fStatsCoalesced, 0, __ATOMIC_RELAXED);
++		const uint64_t gate_us = __atomic_exchange_n(&fStatsGateUs, 0, __ATOMIC_RELAXED);
++		const uint64_t acquire_us = __atomic_exchange_n(&fStatsAcquireUs, 0, __ATOMIC_RELAXED);
++		const uint64_t copy_us = __atomic_exchange_n(&fStatsCopyUs, 0, __ATOMIC_RELAXED);
++		const uint64_t swaps = __atomic_exchange_n(&fStatsSwaps, 0, __ATOMIC_RELAXED);
++		const uint64_t beam_us = __atomic_exchange_n(&fStatsBeamUs, 0, __ATOMIC_RELAXED);
++		const uint64_t beam_skips = __atomic_exchange_n(&fStatsBeamSkips, 0, __ATOMIC_RELAXED);
++		IOLog("SWEET FB: timing window_ms=%llu callbacks=%llu present_calls=%llu missed_deadlines=%llu target=%u Hz present_avg_us=%llu present_max_us=%llu coalesced=%llu swaps=%llu gate_avg_us=%llu acquire_avg_us=%llu copy_avg_us=%llu beam_avg_us=%llu beam_skips=%llu\n",
++		    elapsed / NSEC_PER_MSEC, fStatsCallbacks, presents,
++		    fStatsMissed, fPresentHz, presents ? present_us / presents : 0, present_max, coalesced, swaps,
++		    presents ? gate_us / presents : 0, presents ? acquire_us / presents : 0, presents ? copy_us / presents : 0,
++		    presents ? beam_us / presents : 0, beam_skips);
++		fStatsStart = now;
++		fStatsCallbacks = fStatsMissed = 0;
++	}
++	fVsync->wakeAtTime(fNextVsync);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
++	(void)sender;
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_native_adreno_sample_busy();
++	++fb->fStatsCallbacks;
++	/* Fractional pacing also handles requested rates that do not divide 60. */
++	fb->fPresentPhase += fb->fPresentHz;
++	bool presentDue = fb->fPresentPhase >= fb->fTimerHz;
++	if (presentDue) {
++		fb->fPresentPhase -= fb->fTimerHz;
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -277,24 +698,87 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->rearmVsync();
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-		}
++	bool flush = fb->fDirty && presentDue;
++	if (flush && !fb->fPresentThreaded) {
++		/* Previous behaviour: this tick waits for the GPU and copies. */
++		memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fPresentFence = fb->fPendingFence;
++		fb->fDirty = false;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		fb->present(rec);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	if (flush && fb->fPresentThreaded) {
++		fb->requestPresent();
++	} else if (flush) {
++		const uint64_t began = mach_absolute_time();
++		fb->present(fb->fPresentRec);
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		const uint64_t us = ns / NSEC_PER_USEC;
++		__atomic_add_fetch(&fb->fStatsPresents, 1, __ATOMIC_RELAXED);
++		__atomic_add_fetch(&fb->fStatsPresentUs, us, __ATOMIC_RELAXED);
++		if (us > fb->fStatsPresentMaxUs) {
++			fb->fStatsPresentMaxUs = us;
++		}
++	}
++	fb->rearmVsync();
++}
++
++/* A request while the thread is still copying is coalesced: the thread then
++ * presents the latest pending swap once, instead of queuing stale frames. */
++void
++AppleCLCD::requestPresent(void)
++{
++	IOLockLock(fPresentLock);
++	if (fPresentRequested) {
++		__atomic_add_fetch(&fStatsCoalesced, 1, __ATOMIC_RELAXED);
++	}
++	fPresentRequested = true;
++	IOLockWakeup(fPresentLock, &fPresentRequested, true);
++	IOLockUnlock(fPresentLock);
++}
++
++/* GPU-gate waits and the panel copy run here, never in the vsync timer, so
++ * CoreAnimation keeps receiving vsync at the timer cadence while a frame is
++ * being waited for or copied. */
++void
++AppleCLCD::presentThread(void *arg, wait_result_t result)
++{
++	(void)result;
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	for (;;) {
++		IOLockLock(fb->fPresentLock);
++		while (!fb->fPresentRequested) {
++			IOLockSleep(fb->fPresentLock, &fb->fPresentRequested, THREAD_UNINT);
++		}
++		fb->fPresentRequested = false;
++		IOLockUnlock(fb->fPresentLock);
++		bool take = false;
++		IOLockLock(fb->fLock);
++		if (fb->fDirty && !fb->fPowerOff) {
++			memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fPresentFence = fb->fPendingFence;
++			fb->fDirty = false;
++			take = true;
++		}
++		IOLockUnlock(fb->fLock);
++		if (!take) {
++			continue;
++		}
++		const uint64_t began = mach_absolute_time();
++		fb->present(fb->fPresentRec);
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		const uint64_t us = ns / NSEC_PER_USEC;
++		__atomic_add_fetch(&fb->fStatsPresents, 1, __ATOMIC_RELAXED);
++		__atomic_add_fetch(&fb->fStatsPresentUs, us, __ATOMIC_RELAXED);
++		uint64_t max = __atomic_load_n(&fb->fStatsPresentMaxUs, __ATOMIC_RELAXED);
++		while (us > max && !__atomic_compare_exchange_n(&fb->fStatsPresentMaxUs, &max, us,
++		    false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++		}
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+@@ -330,25 +814,212 @@ static uint64_t sweet_fb_swap_count;
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+- * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+- * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+- * default 10 Hz).
++ * swap consumed substantial CPU time. The timer presents the latest frame
++ * at sweetfb_hz (default 10, maximum 120); it does not program the DSI panel
++ * or enable GPU rendering. Presentation time is included in deadline pacing.
+  */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	const uint32_t fence = sweet_native_adreno_last_fence();
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingFence = fence;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	__atomic_add_fetch(&fStatsSwaps, 1, __ATOMIC_RELAXED);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
++/* Noncoherent A618 writes need a real physical cache acquire. The ARM64
++ * IOMemoryDescriptor coherent-I/O shortcut is only a barrier on this kernel.
++ * Surface descriptors remain prepared/pinned for the retained surface's life.
++ * CIVAC preserves dirty neighbouring bytes on partially used source pages. */
++static IOReturn sweet_fb_acquire(SweetSurface *s,uint64_t first,uint64_t last)
++{
++ const uint64_t start=first&~UINT64_C(4095),end=(last+4095)&~UINT64_C(4095);
++ if(last<=first || end<last || end>s->memory->getLength())return kIOReturnBadArgument;
++ for(uint64_t offset=start;offset<end;) {
++  IOByteCount span=0;
++  const uint64_t physical=s->memory->getPhysicalSegment(offset,&span,kIOMemoryMapperNone);
++  uint64_t bytes=span<end-offset?span:end-offset;
++  if(!physical || !bytes || ((physical|bytes)&4095))return kIOReturnUnsupported;
++  const IOReturn result=NativeAdrenoMaintainPhysicalPages(physical,(size_t)bytes,NativeAdrenoCleanInvalidate);
++  if(result)return result;
++  offset+=bytes;
++ }
++ return kIOReturnSuccess;
++}
++
++/* Find the running DSI timing engine (INTF_1/INTF_2) and measure its line
++ * period from the hardware frame counter. Any inconsistency leaves the copy
++ * unsynchronised, as before 0144. Runs once, on the present thread. */
++void
++AppleCLCD::beamProbe(void)
++{
++	fBeamProbed = true;
++	int beam = 1;
++	PE_parse_boot_argn("sweetfbbeam", &beam, sizeof(beam));
++	if (!beam) {
++		IOLog("SWEET FB: beam-raced copy off (sweetfbbeam=0)\n");
++		return;
++	}
++	volatile uint32_t *intf = (volatile uint32_t *)ml_io_map(SWEET_INTF_PA, 0x2000);
++	if (intf == NULL) {
++		IOLog("SWEET FB: beam: INTF map failed\n");
++		return;
++	}
++	for (unsigned i = 1; i <= 2; i++) {
++		volatile uint32_t *r = intf + i * 0x800 / 4;
++		const uint32_t en = r[INTF_TIMING_ENGINE_EN / 4], hctl = r[INTF_HSYNC_CTL / 4];
++		const uint32_t period = r[INTF_VSYNC_PERIOD_F0 / 4], vstart = r[INTF_DISPLAY_V_START_F0 / 4];
++		const uint32_t vend = r[INTF_DISPLAY_V_END_F0 / 4], lce = r[INTF_FRAME_LINE_COUNT_EN / 4];
++		IOLog("SWEET FB: beam: INTF_%u en=%#x hsync_ctl=%#x vsync_period=%#x v_start=%#x v_end=%#x count_en=%#x frame=%u line=%u\n",
++		    i, en, hctl, period, vstart, vend, lce, r[INTF_FRAME_COUNT / 4], r[INTF_LINE_COUNT / 4]);
++		const uint32_t hp = hctl >> 16;
++		if (!(en & 1) || hp == 0 || fIntf != NULL) {
++			continue;
++		}
++		const uint32_t total = period / hp, first = vstart / hp, last = (vend + 1) / hp;
++		if (last <= first || last > total || last - first != fHeight) {
++			IOLog("SWEET FB: beam: INTF_%u lines total=%u active=%u-%u do not match %u rows\n",
++			    i, total, first, last, fHeight);
++			continue;
++		}
++		fIntf = r;
++		fBeamTotal = total;
++		fBeamFirst = first;
++		fBeamLast = last;
++	}
++	if (fIntf == NULL) {
++		IOLog("SWEET FB: beam: no usable DSI timing engine; copy unsynchronised\n");
++		return;
++	}
++	if ((fIntf[INTF_FRAME_LINE_COUNT_EN / 4] & 3) != 3) {
++		fIntf[INTF_FRAME_LINE_COUNT_EN / 4] = 3;
++		IODelay(50);
++	}
++	/* Frame period between two counter edges ~200 ms apart. */
++	uint32_t f0 = fIntf[INTF_FRAME_COUNT / 4];
++	uint64_t t0 = 0, t1 = 0;
++	for (unsigned spins = 0; spins < 400; spins++) {
++		const uint32_t f = fIntf[INTF_FRAME_COUNT / 4];
++		if (f != f0) {
++			f0 = f;
++			t0 = mach_absolute_time();
++			break;
++		}
++		IODelay(50);
++	}
++	IOSleep(190);
++	uint32_t f1 = fIntf[INTF_FRAME_COUNT / 4];
++	const uint32_t target = f1 + 1;
++	for (unsigned spins = 0; t0 && spins < 400; spins++) {
++		f1 = fIntf[INTF_FRAME_COUNT / 4];
++		if (f1 == target) {
++			t1 = mach_absolute_time();
++			break;
++		}
++		IODelay(50);
++	}
++	uint64_t ns = 0;
++	if (t0 && t1) {
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++	}
++	const uint32_t frames = f1 - f0;
++	if (!t1 || frames == 0 || frames > 1000) {
++		IOLog("SWEET FB: beam: frame counter not advancing (frames=%u); copy unsynchronised\n", frames);
++		return;
++	}
++	fBeamLineNs = ns / frames / fBeamTotal;
++	uint32_t lines[4];
++	for (unsigned i = 0; i < 4; i++) {
++		lines[i] = fIntf[INTF_LINE_COUNT / 4];
++		IODelay(1000);
++	}
++	fBeam = fBeamLineNs != 0;
++	IOLog("SWEET FB: beam-raced copy %s: %u lines (active %u-%u), frame %llu us over %u frames, line %llu ns, samples %u %u %u %u\n",
++	    fBeam ? "on" : "off", fBeamTotal, fBeamFirst, fBeamLast, ns / frames / 1000, frames, fBeamLineNs,
++	    lines[0], lines[1], lines[2], lines[3]);
++}
++
++/* The copy writes rows top to bottom faster than the panel scans them. Begun
++ * while the scan is at active row b, it overtakes the scan at row
++ * b/(1 - copy/scan) - after the last copied row when b >= rows*(1 - copy/scan).
++ * So start in that late window (with a 1.5x copy-time margin), never in the
++ * last lines before the wrap, where fetch-ahead may already read the next frame. */
++void
++AppleCLCD::beamWait(uint32_t rows)
++{
++	if (!fBeamProbed) {
++		beamProbe();
++	}
++	if (!fBeam || rows == 0 || rows > fBeamLast - fBeamFirst) {
++		return;
++	}
++	const uint64_t copy = (fCopyRowNs ? fCopyRowNs : 1100) * 3 / 2, scan = fBeamLineNs;
++	if (copy >= scan) {
++		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	const uint32_t from = fBeamFirst + rows - (uint32_t)((uint64_t)rows * copy / scan);
++	const uint32_t to = fBeamLast - 16;
++	if (from >= to) {
++		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
++		return;
++	}
++	const uint64_t began = mach_absolute_time();
++	uint32_t line = 0, before = fIntf[INTF_LINE_COUNT / 4];
++	bool ok = false;
++	for (unsigned tries = 0; tries < 6; tries++) {
++		line = fIntf[INTF_LINE_COUNT / 4];
++		if (line >= fBeamTotal) {
++			break;
++		}
++		if (line >= from && line < to) {
++			ok = true;
++			break;
++		}
++		const uint32_t ahead = line < from ? from - line : fBeamTotal - line + from;
++		IODelay((unsigned)((uint64_t)ahead * scan / NSEC_PER_USEC) + 1);
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++	__atomic_add_fetch(&fStatsBeamUs, ns / NSEC_PER_USEC, __ATOMIC_RELAXED);
++	if (!ok) {
++		__atomic_add_fetch(&fStatsBeamSkips, 1, __ATOMIC_RELAXED);
++	}
++	static unsigned logged;
++	if (logged < 8 || !ok) {
++		if (logged < 24) {
++			logged++;
++			IOLog("SWEET FB: beam wait rows=%u window=%u-%u line %u -> %u in %llu us copy_row_ns=%llu %s\n",
++			    rows, from, to, before, line, ns / NSEC_PER_USEC, fCopyRowNs, ok ? "ok" : "gave up");
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	/* RAII releases the GPU gate on every return. No framebuffer client lock
++	 * is held while waiting for GPU completion. Zero keeps early CPU boots. */
++	struct PresentGate {
++		int state;
++		explicit PresentGate(uint32_t fence):state(sweet_native_adreno_cpu_present_begin(fence)) {}
++		~PresentGate(){if(state>0)sweet_native_adreno_cpu_present_end(state);}
++	};
++	const uint64_t gate_began = mach_absolute_time();
++	PresentGate gate(fPresentFence);
++	uint64_t gate_ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - gate_began, &gate_ns);
++	__atomic_add_fetch(&fStatsGateUs, gate_ns / NSEC_PER_USEC, __ATOMIC_RELAXED);
++	if(gate.state<0) {
++		IOLockLock(fLock);fDirty=true;IOLockUnlock(fLock);
++		return; // retain the last complete panel frame after a GPU fault
++	}
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+ 
+@@ -428,12 +1099,38 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (src != 0 && bpe == 4 && gate.state>0) {
++			const uint64_t first=(uint64_t)s->offset+(uint64_t)sy*s->bytesPerRow+(uint64_t)sx*4;
++			const uint64_t acquire_began=mach_absolute_time();
++			const IOReturn result=sweet_fb_acquire(s,first,last);
++			uint64_t acquire_ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-acquire_began,&acquire_ns);
++			__atomic_add_fetch(&fStatsAcquireUs,acquire_ns/NSEC_PER_USEC,__ATOMIC_RELAXED);
++			if(result) {
++				static unsigned refusals=0;
++				if(++refusals<=4 || refusals%120==0)
++					IOLog("SWEET FB: CPU source acquire refused result=%#x\n",result);
++				IOLockLock(fLock);fDirty=true;IOLockUnlock(fLock);
++				src=0;
++			}
++		}
+ 		if (src != 0 && bpe == 4) {
++			if (gate.state > 0 && dy == 0) {
++				beamWait((uint32_t)h);
++			}
++			const uint64_t copy_began = mach_absolute_time();
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			uint64_t copy_ns = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - copy_began, &copy_ns);
++			__atomic_add_fetch(&fStatsCopyUs, copy_ns / NSEC_PER_USEC, __ATOMIC_RELAXED);
++			if (h >= 256 && w >= (int32_t)fWidth / 2) {
++				/* Running estimate of the time per copied panel row. */
++				const uint64_t row = copy_ns / (uint64_t)h;
++				fCopyRowNs = fCopyRowNs ? (fCopyRowNs * 3 + row) / 4 : row;
++			}
+ 		}
+ 		s->release();
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index efa2806..6a64a2b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -84,6 +85,7 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (clientMemory && memory != NULL) memory->complete();
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -98,7 +100,7 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(mapCache | (readOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -276,6 +278,16 @@ sweet_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
+ 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ }
+ 
++static uint32_t
++sweet_gles_rows(uint32_t asked, uint32_t width, uint32_t ew, uint32_t bpe, bool client)
++{
++    if (!asked) return sweet_row_bytes(width,ew,bpe);
++    char name[32]={0};proc_selfname(name,sizeof(name));
++    const uint64_t align=bpe>4 && bpe<=8 ? 128 : 64;
++    return !client && !strcmp(name,"backboardd") ?
++        (uint32_t)(((uint64_t)asked+align-1)&~(align-1)) : asked;
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -294,11 +306,34 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
++	s->bytesPerRow = sweet_gles_rows(sweet_dict_u32(props,"IOSurfaceBytesPerRow",0),
++        s->width,s->elementWidth,s->bytesPerElement,props->getObject("IOSurfaceAddress")!=NULL);
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++    /* Sunfish0159 adaptation: align only allocations owned by this driver.
++     * A caller's IOSurfaceAddress/plane layout is an external memory contract.
++     * Turnip requires at least64-byte linear rows; 8-byte texels need128-byte
++     * rows for A6xx's16-pixel GMEM store block. Logical width stays unchanged. */
++    uint32_t metal=0,gles=0,alignment=64;
++    PE_parse_boot_argn("sweetmtl",&metal,sizeof metal);
++    PE_parse_boot_argn("sweetgles",&gles,sizeof gles);
++    PE_parse_boot_argn("sweetsurfalign",&alignment,sizeof alignment);
++    if(metal==2 && gles!=1 && alignment>=64 && alignment<=4096 &&
++       !(alignment&(alignment-1)) && !props->getObject("IOSurfaceAddress") &&
++       !props->getObject("IOSurfacePlaneInfo") && s->elementWidth==1 &&
++       s->elementHeight==1 && s->bytesPerElement && s->bytesPerElement<=8 &&
++       !(s->bytesPerElement&(s->bytesPerElement-1))) {
++        if(alignment<16u*s->bytesPerElement)alignment=16u*s->bytesPerElement;
++        const uint64_t row=((uint64_t)s->bytesPerRow+alignment-1)&~((uint64_t)alignment-1);
++        if(row>0xffffffffu)return kIOReturnBadArgument;
++        s->bytesPerRow=(uint32_t)row;
++        static bool logged=false;
++        if(!logged) {
++            logged=true;
++            IOLog("SWEET SURF: Metal owned rows align %u; caller layouts preserved\n",alignment);
++        }
++    }
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+@@ -336,6 +371,15 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		s->planeCount = planes->getCount();
+ 	}
+ 
++    // A6xx linear GMEM stores touch complete 16x4 pixel blocks. Preserve
++    // logical height but back the last partial block with actual storage.
++    // Caller-owned IOSurfaceAddress memory cannot be extended here.
++    if(!props->getObject("IOSurfaceAddress") && s->planeCount==0 &&
++       s->elementWidth==1 && s->elementHeight==1 && s->bytesPerElement &&
++       s->bytesPerElement<=8 && !(s->bytesPerElement&(s->bytesPerElement-1))) {
++        uint64_t padded=(uint64_t)s->offset+(uint64_t)s->bytesPerRow*((s->height+3u)&~3u);
++        if(padded>end)end=padded;
++    }
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+ 	if (alloc < end) {
+ 		alloc = end;
+@@ -527,7 +571,8 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache |
++	    (s->readOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -685,7 +730,27 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++    OSNumber *address=OSDynamicCast(OSNumber,props->getObject("IOSurfaceAddress"));
++    if (ret==kIOReturnSuccess && address!=NULL) {
++        uint64_t addr=address->unsigned64BitValue(), start=trunc_page_64(addr);
++        uint64_t used=(uint64_t)s->bytesPerRow*sweet_div_up(s->height,s->elementHeight);
++        uint64_t len=round_page_64((addr-start)+used);
++        bool valid=addr && used && len && s->planeCount==0 &&
++            len<=SWEET_SURFACE_MAX_ALLOC && addr+used>=addr;
++        IOMemoryDescriptor *md=valid?IOMemoryDescriptor::withAddressRange(start,len,kIODirectionInOut,fTask):NULL;
++        if (md && md->prepare()!=kIOReturnSuccess) {
++            OSSafeReleaseNULL(md);
++            md=IOMemoryDescriptor::withAddressRange(start,len,kIODirectionOut,fTask);
++            if (md && md->prepare()!=kIOReturnSuccess) OSSafeReleaseNULL(md);
++            s->readOnly=md!=NULL;
++        }
++        if (!md) ret=kIOReturnVMError;
++        else {
++            s->memory=md;s->clientMemory=true;s->mapCache=kIOMapDefaultCache;
++            s->offset=(uint32_t)(addr-start);s->allocSize=(uint32_t)len;
++            if (!sweet_surface_publish(s)) ret=kIOReturnNoResources;
++        }
++    } else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -740,6 +805,9 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
++	case 6:
++	case 7:
++		return kIOReturnUnsupported;
+ 	case kSweetSurfaceLookup: {
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..5c08eed 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,6 +40,9 @@ public:
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 
++	bool clientMemory=false;
++	bool readOnly=false;
++
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 

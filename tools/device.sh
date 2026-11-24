@@ -1,31 +1,15 @@
 #!/bin/bash
-# Device-side helpers for the joyeuse iOS port. Nothing here runs by itself;
-# the destructive steps (flash userdata, boot) are separate commands.
-#
-#   device.sh status            fastboot/adb visibility
-#   device.sh backup DIR        pull the per-device calibration partitions
-#   device.sh flash-root IMG    fastboot flash userdata  (ERASES ANDROID DATA)
-#   device.sh boot IMG          fastboot boot (RAM only, writes nothing)
-#   device.sh pull-log FILE     read the 4 MiB console ring from userdata
-#
-# ADB/fastboot come from the Android platform-tools already on PATH.
+# Device helpers. Raw reads/writes are restricted to the dedicated iosroot partition.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 
-# Sets $device to the single connected fastboot device, which must be a joyeuse.
 joyeuse_device() {
 	local devices product
 	devices=$(fastboot devices)
-	[[ $(printf '%s\n' "$devices" | grep -c .) = 1 ]] || {
-		echo "Need exactly one fastboot device; refusing to select another port's phone." >&2
-		exit 1
-	}
+	[[ $(printf '%s\n' "$devices" | grep -c .) = 1 ]] || { echo "Need exactly one fastboot device." >&2; exit 1; }
 	device=$(printf '%s\n' "$devices" | awk '{print $1}')
 	product=$(fastboot -s "$device" getvar product 2>&1 | awk '$1 == "product:" {print $2}')
-	[[ $product = joyeuse ]] || {
-		echo "Connected fastboot device reports product '$product', not joyeuse; refusing." >&2
-		exit 1
-	}
+	[[ $product = joyeuse ]] || { echo "Not a joyeuse device: $product" >&2; exit 1; }
 }
 
 case ${1:-} in
@@ -35,74 +19,27 @@ status)
 	;;
 backup)
 	dir=${2:?usage: device.sh backup DIR}
-	mkdir -p "$(dirname "$dir")"
-	mkdir "$dir"
-	# persist/modemst1/modemst2/fsg/fsc carry per-device calibration: without
-	# them the radio never works again even on stock Android.
-	#
-	# `adb exec-out "dd if=<missing>"` exits 0 and writes nothing, so verify
-	# every dump against the size the kernel reports.
-	missing=""
-	persist_missing=0
-	for p in persist modemst1 modemst2 fsg fsc boot dtbo vbmeta modem; do
-		# Partition names depend on the installed firmware; accept either form.
-		dev=""
-		for cand in "$p" "${p}_a"; do
-			if adb shell "[ -e /dev/block/by-name/$cand ]" 2>/dev/null; then
-				dev=$cand; break
-			fi
-		done
-		if [ -z "$dev" ]; then
-			echo "absent  $p (no /dev/block/by-name/$p or ${p}_a)"
-			missing="$missing $p"
-			[ "$p" = persist ] && persist_missing=1
-			continue
-		fi
-		# `|| true`: under `set -e` a failing command substitution in an
-		# assignment aborts the whole script before the error can be printed.
-		want=$(adb shell "blockdev --getsize64 /dev/block/by-name/$dev" 2>/dev/null | tr -d '\r' || true)
-		case $want in
-		""|*[!0-9]*)
-			echo "ERROR: cannot read the size of $dev (blockdev said: ${want:-nothing})." >&2
-			echo "       adb must be root to read raw partitions: run 'adb root' (recovery or an" >&2
-			echo "       eng/userdebug Android build; stock Android cannot). Nothing was written" >&2
-			echo "       for $p, and an unverified dump is worse than none." >&2
-			exit 1
-			;;
-		esac
-		echo "pulling $dev ($want bytes)"
-		adb exec-out "dd if=/dev/block/by-name/$dev 2>/dev/null" > "$dir/$p.img"
-		got=$(stat -c %s "$dir/$p.img" 2>/dev/null) || got=$(stat -f %z "$dir/$p.img")
-		if [ "$got" != "$want" ]; then
-			echo "ERROR: $p dumped $got bytes, device reports $want" >&2
-			exit 1
-		fi
-	done
-	if [ "$persist_missing" = 1 ]; then
-		# persist is not optional: losing it costs the IMEI and the radio.
-		echo "ERROR: persist not found; refusing to call this a backup" >&2
-		exit 1
-	fi
-	if [ -n "$missing" ]; then
-		echo "note: absent on this device:$missing"
-	fi
-	shasum -a 256 "$dir"/*.img > "$dir/SHA256SUMS"
-	echo "backed up to $dir"
+	mkdir -p "$(dirname "$dir")"; mkdir "$dir"
+	dev=$(adb shell 'readlink -f /dev/block/by-name/iosroot 2>/dev/null' | tr -d '\r')
+	[[ $dev == /dev/block/* ]] || { echo "iosroot not found; refusing other partitions" >&2; exit 1; }
+	want=$(adb shell "blockdev --getsize64 '$dev'" | tr -d '\r')
+	adb exec-out "dd if='$dev' 2>/dev/null" > "$dir/iosroot.img"
+	got=$(stat -c %s "$dir/iosroot.img")
+	[[ $got == "$want" ]] || { echo "iosroot read incomplete" >&2; exit 1; }
+	sha256sum "$dir/iosroot.img" > "$dir/SHA256SUMS"
 	;;
 flash-root)
 	img=${2:?usage: device.sh flash-root IMG}
 	[[ -f $img ]] || { echo "no image: $img" >&2; exit 1; }
+	case ${3:-iosroot} in iosroot) ;; userdata|boot|recovery) echo "Refusing target ${3}; only iosroot is permitted" >&2; exit 1;; *) echo "Target must be iosroot" >&2; exit 1;; esac
 	joyeuse_device
-	read -r -p "Erase Android user data and flash $img? Type ERASE: " answer
-	[[ $answer = ERASE ]] || { echo "cancelled" >&2; exit 1; }
-	# -S 512M: fastboot both splits the transfer and sparsifies the image.
-	# Xiaomi's ABL often hangs after this finishes -> power + volume down.
-	fastboot -s "$device" -S 512M flash userdata "$img"
+	read -r -p "Type FLASH-IOSROOT to write only iosroot: " answer
+	[[ $answer == FLASH-IOSROOT ]] || { echo cancelled >&2; exit 1; }
+	fastboot -s "$device" -S 512M flash iosroot "$img"
 	;;
 boot)
 	img=${2:?usage: device.sh boot IMG}
 	joyeuse_device
-	# RAM only: nothing is written, the stock boot chain stays in charge.
 	fastboot -s "$device" boot "$img"
 	;;
 pull-log)
@@ -110,7 +47,7 @@ pull-log)
 	"$REPO/tools/sweet-log-pull.sh" "$out"
 	;;
 *)
-	sed -n '2,12p' "$0"
+	echo "Usage: device.sh status|backup DIR|flash-root IMG [iosroot]|boot IMG|pull-log FILE" >&2
 	exit 2
 	;;
 esac

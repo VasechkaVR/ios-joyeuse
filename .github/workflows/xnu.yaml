@@ -26,7 +26,7 @@ env:
 jobs:
   build:
     # XNU 8796 predates Xcode 16's IIG output, so Install Dependencies selects the oldest Xcode.
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7

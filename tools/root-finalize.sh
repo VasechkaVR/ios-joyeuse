@@ -22,7 +22,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 # error, and the image would boot into a wall of EACCES.
 probe=$root/.ios-joyeuse-owner-probe
 touch "$probe"; chown 272:272 "$probe"
-if [ "$(stat -f %u "$probe")" != 272 ]; then
+if [ "$(stat -c %u "$probe" 2>/dev/null || stat -f %u "$probe")" != 272 ]; then
 	rm -f "$probe"
 	echo "ERROR: $root is mounted with noowners; ownership cannot be set." >&2
 	echo "       remount with -mountOptions owners and re-run." >&2
@@ -99,7 +99,7 @@ bad=0
 check_owner() {
 	local got
 	[ -e "$root/$1" ] || return 0
-	got=$(stat -f %u "$root/$1")
+	got=$(stat -c %u "$root/$1" 2>/dev/null || stat -f %u "$root/$1")
 	[ "$got" = "$2" ] || { echo "   MISMATCH $1: uid $got, want $2"; bad=1; }
 }
 check_owner bin/ls 0

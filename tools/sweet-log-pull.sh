@@ -2,13 +2,13 @@
 # Read the SWEET console log (kernel patch 0047) from a phone booted into
 # recovery with an adb root shell (tools/device.sh boot RECOVERY.img).
 #   tools/sweet-log-pull.sh OUT.txt
-# Only reads: the last 1025 blocks (4 KiB) of the userdata partition.
+# Only reads: the last 1025 blocks (4 KiB) of the iosroot partition.
 set -eu
 out=${1:?usage: sweet-log-pull.sh OUT.txt}
 # Device paths and variables are resolved on the phone.
 # shellcheck disable=SC2016
-dev=$(adb shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
-[ -n "$dev" ] || { echo "userdata block device not found" >&2; exit 1; }
+dev=$(adb shell 'for d in /dev/block/by-name/iosroot /dev/block/bootdevice/by-name/iosroot; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
+[ -n "$dev" ] || { echo "iosroot block device not found" >&2; exit 1; }
 bytes=$(adb shell blockdev --getsize64 "$dev" | tr -d '\r')
 mkdir -p "$(dirname "$out")"
 skip=$((bytes / 4096 - 1025))
