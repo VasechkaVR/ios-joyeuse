@@ -2,13 +2,6 @@ name: Joyeuse GPU Userland
 
 on:
   workflow_dispatch:
-  push:
-    branches: [gpu-port]
-    paths:
-      - .github/workflows/gpu-userland.yaml
-      - gpu-userland/**
-      - xnu/patches/0119-*
-      - xnu/patches/012[0-8]-*
 
 permissions:
   contents: read
