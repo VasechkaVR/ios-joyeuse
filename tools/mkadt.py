@@ -324,8 +324,6 @@ def build(
         chosen.props.extend(
             [
                 ("focaltech-firmware", 0, Path(touch_firmware).read_bytes()),
-                ("zap-reserved-base", 0, u64(0x93B15000)),
-                *adreno_props,
             ]
         )
 
@@ -369,7 +367,7 @@ def build(
         ],
         [chosen, defaults, cpus, arm_io, fbcon, buttons]
         + product_nodes
-        + ([] if qemu else [ufs]),
+        + ([] if qemu else [ufs, node("sweet-adreno", [ph(), ("zap-reserved-base", u64(0x93B15000)), ("zap-reserved-size", u32(0x2000))] + [(k, v) for k, _, v in adreno_props])]),
     )
 
 
