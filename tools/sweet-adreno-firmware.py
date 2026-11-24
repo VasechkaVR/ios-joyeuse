@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate joyeuse Adreno firmware inputs and report SHA-256 digests."""
+
 import hashlib
 import struct
 import sys
@@ -12,6 +13,7 @@ EXPECTED = {
     "a615_zap.mdt": 0x1ACC,
     "a615_zap.b02": 0x7C0,
 }
+
 
 def firmware_properties(directory="fw"):
     root = Path(directory)
@@ -36,6 +38,7 @@ def firmware_properties(directory="fw"):
         props.append((crc_prop, 0, struct.pack("<I", zlib.crc32(data))))
     return props
 
+
 def main():
     root = Path(sys.argv[1] if len(sys.argv) > 1 else "fw")
     missing = []
@@ -51,6 +54,7 @@ def main():
             return 1
         print(f"{name} sha256={hashlib.sha256(data).hexdigest()} size={len(data):#x}")
     return 1 if missing else 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

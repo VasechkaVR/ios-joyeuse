@@ -18,10 +18,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt
+
 try:
     from sweet_adreno_firmware import firmware_properties
 except ModuleNotFoundError:
-    from importlib.util import spec_from_file_location, module_from_spec
+    from importlib.util import module_from_spec, spec_from_file_location
 
     _spec = spec_from_file_location(
         "sweet_adreno_firmware", Path(__file__).with_name("sweet-adreno-firmware.py")
