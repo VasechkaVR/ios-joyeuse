@@ -274,7 +274,7 @@ index 68612db..21d0738 100644
 +            if (imgp->ip_argspace<ptr_size) return E2BIG;
 +            static const char ca_env[]="CA_FORCE_TIMER=1";
 +            int error=exec_add_user_string(imgp,CAST_USER_ADDR_T(ca_env),UIO_SYSSPACE,TRUE);
-+            if (error) return error;
++            if (ca_err) return ca_err;
 +            if (imgp->ip_argspace<ptr_size) return E2BIG;
 +            imgp->ip_argspace-=ptr_size;
 +            imgp->ip_envc++;
