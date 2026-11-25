@@ -257,19 +257,32 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 68612db..21d0738 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -445,6 +445,28 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+@@ -445,6 +445,42 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
  	return error;
  }
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+/* Fixed, compositor-only GLES bootstrap. Inactive on ordinary Metal boots. */
++/* Fixed, compositor-only GLES bootstrap + QuartzCore timer env for Metal UI. */
 +static int
 +sweet_gles_exec_env(struct image_params *imgp, int ptr_size)
 +{
-+    int enabled=0;
-+    if (!PE_parse_boot_argn("sweetgles", &enabled, sizeof(enabled)) || enabled!=1) return 0;
 +    const char *path=imgp->ip_strings+strlen("executable_path="), *base=path;
 +    for (const char *c=path; *c; ++c) if (*c=='/') base=c+1;
++    int mtl=0;
++    if (PE_parse_boot_argn("sweetmtl", &mtl, sizeof(mtl)) && mtl==2) {
++        if (!strcmp(base,"SpringBoard") || !strcmp(base,"backboardd") || !strcmp(base,"PosterBoard")) {
++            if (imgp->ip_argspace<ptr_size) return E2BIG;
++            static const char ca_env[]="CA_FORCE_TIMER=1";
++            int error=exec_add_user_string(imgp,CAST_USER_ADDR_T(ca_env),UIO_SYSSPACE,TRUE);
++            if (error) return error;
++            if (imgp->ip_argspace<ptr_size) return E2BIG;
++            imgp->ip_argspace-=ptr_size;
++            imgp->ip_envc++;
++            printf("SWEET UI: %s will run with CA_FORCE_TIMER=1\n", base);
++        }
++    }
++    int enabled=0;
++    if (!PE_parse_boot_argn("sweetgles", &enabled, sizeof(enabled)) || enabled!=1) return 0;
 +    if (strcmp(base,"backboardd")) return 0;
 +    if (imgp->ip_argspace<ptr_size) return E2BIG;
 +    static const char env[]="DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib";
