@@ -213,6 +213,49 @@ def network(root):
     print("network: en0 DHCP service prepared (radio still requires wifi boot profile)")
 
 
+
+def managed_configuration(root):
+    # profiled's own launchd KeepAlive PathState probes are signals; seed the
+    # parent directory, not the marker files, so it can publish its XPC service
+    # and decide whether work is outstanding itself.
+    profiles = os.path.join(root, "private/var/mobile/Library/UserConfigurationProfiles")
+    if not os.path.isdir(profiles):
+        os.makedirs(profiles, exist_ok=True)
+        os.chown(profiles, MOBILE, MOBILE)
+        os.chmod(profiles, 0o700)
+        print("mkdir", profiles)
+
+
+def posterboard_and_tcc(root):
+    tcc = os.path.join(root, "private/var/mobile/Library/TCC")
+    if not os.path.isdir(tcc):
+        os.makedirs(tcc, exist_ok=True)
+        os.chown(tcc, MOBILE, MOBILE)
+        os.chmod(tcc, 0o700)
+        print("mkdir", tcc)
+
+    angel_path = os.path.join(root, "System/Library/LaunchAngels/com.apple.PosterBoard.plist")
+    ld_path = os.path.join(root, "System/Library/xpc/launchd.plist")
+    if os.path.exists(angel_path) and os.path.exists(ld_path):
+        st = os.stat(ld_path)
+        plist = load(ld_path)
+        jobs = plist["LaunchDaemons"]
+        # Disable every merged registration for this label, including the
+        # LaunchAngel entry: launchd uses the merged dictionary at bootstrap.
+        for existing in jobs.values():
+            if existing.get("Label") == "com.apple.PosterBoard":
+                existing["RunAtLoad"] = False
+                existing["Disabled"] = True
+        key = "/System/Library/LaunchDaemons/com.apple.PosterBoard.plist"
+        job = load(angel_path)
+        job["RunAtLoad"] = False
+        job["Disabled"] = True
+        save(angel_path, job, os.stat(angel_path).st_uid, os.stat(angel_path).st_gid, os.stat(angel_path).st_mode & 0o7777)
+        job["MachServices"] = {"com.apple.posterboardservices.services": True}
+        jobs[key] = job
+        save(ld_path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+        print("launchd.plist: kept com.apple.PosterBoard disabled (early LaunchServices registration can hang SpringBoard)")
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(
         os.path.join(sys.argv[1], "System/Library/xpc")
@@ -225,6 +268,8 @@ def main():
     build = system_version["ProductBuildVersion"]
     version = system_version["ProductVersion"]
     launchd(root)
+    managed_configuration(root)
+    posterboard_and_tcc(root)
     containers(root)
     activation(root, build, version)
     audio(root)

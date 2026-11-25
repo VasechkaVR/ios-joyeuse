@@ -257,7 +257,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 68612db..21d0738 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -445,6 +445,42 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+@@ -445,6 +445,41 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
  	return error;
  }
  

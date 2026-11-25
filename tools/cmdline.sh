@@ -17,7 +17,7 @@ shift
 
 if [ "$base" = good ]; then
 	# The exact command line reported for the upstream 0098 boot.
-	base_line='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress ufsroot=iosroot rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetpresentwait=1 sweettouchdelay=5 panichalt=1 ufslogsecs=2 sweetfb_noconsole=1'
+	base_line='debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress ufsroot=iosroot rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetpresentwait=1 sweettouchdelay=5 panichalt=1 ufslogsecs=2 sweetfb_noconsole=1 sweetsample=SpringBoard,backboardd,lsd,installd'
 elif [ "$base" = gpu ]; then
 	base_line="$("$0" good) sweetgpu=9"
 elif [ "$base" = wifi ]; then
