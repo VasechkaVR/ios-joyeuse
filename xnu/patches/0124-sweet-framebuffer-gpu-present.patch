@@ -257,7 +257,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 68612db..21d0738 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -445,6 +445,42 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+@@ -445,6 +445,43 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
  	return error;
  }
  
@@ -283,6 +283,8 @@ index 68612db..21d0738 100644
 +    }
 +    int enabled=0;
 +    if (!PE_parse_boot_argn("sweetgles", &enabled, sizeof(enabled)) || enabled!=1) return 0;
++    const char *path=imgp->ip_strings+strlen("executable_path="), *base=path;
++    for (const char *c=path; *c; ++c) if (*c=='/') base=c+1;
 +    if (strcmp(base,"backboardd")) return 0;
 +    if (imgp->ip_argspace<ptr_size) return E2BIG;
 +    static const char env[]="DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib";
@@ -299,7 +301,7 @@ index 68612db..21d0738 100644
  /*
   * dyld is now passed the executable path as a getenv-like variable
   * in the same fashion as the stack_guard and malloc_entropy keys.
-@@ -5741,6 +5777,11 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5778,11 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
