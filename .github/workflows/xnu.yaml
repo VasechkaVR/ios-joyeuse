@@ -2,7 +2,7 @@ name: XNU
 
 on:
   push:
-    branches: [main]
+    branches: [main, gpu-port]
     paths:
       - .github/workflows/xnu.yaml
       - xnu/patches/**
