@@ -299,7 +299,7 @@ index 68612db..21d0738 100644
  /*
   * dyld is now passed the executable path as a getenv-like variable
   * in the same fashion as the stack_guard and malloc_entropy keys.
-@@ -5741,6 +5763,11 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5777,11 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
