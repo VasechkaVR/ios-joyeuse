@@ -18,10 +18,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt
+
 try:
     from sweet_adreno_firmware import firmware_properties
 except ModuleNotFoundError:
-    from importlib.util import spec_from_file_location, module_from_spec
+    from importlib.util import module_from_spec, spec_from_file_location
 
     _spec = spec_from_file_location(
         "sweet_adreno_firmware", Path(__file__).with_name("sweet-adreno-firmware.py")
@@ -320,12 +321,23 @@ def build(
         ],
     )
 
+    hardware_nodes = []
     if not qemu:
-        chosen.props.extend(
-            [
-                ("focaltech-firmware", 0, Path(touch_firmware).read_bytes()),
-            ]
+        chosen.props.append(
+            ("focaltech-firmware", 0, Path(touch_firmware).read_bytes())
         )
+        hardware_nodes = [
+            ufs,
+            node(
+                "sweet-adreno",
+                [
+                    ph(),
+                    ("zap-reserved-base", u64(0x93B15000)),
+                    ("zap-reserved-size", u32(0x2000)),
+                    *((name, value) for name, _, value in adreno_props),
+                ],
+            ),
+        ]
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -367,7 +379,7 @@ def build(
         ],
         [chosen, defaults, cpus, arm_io, fbcon, buttons]
         + product_nodes
-        + ([] if qemu else [ufs, node("sweet-adreno", [ph(), ("zap-reserved-base", u64(0x93B15000)), ("zap-reserved-size", u32(0x2000))] + [(k, v) for k, _, v in adreno_props])]),
+        + hardware_nodes,
     )
 
 

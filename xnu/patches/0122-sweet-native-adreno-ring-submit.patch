@@ -417,7 +417,7 @@ index 0000000..9bd17ad
 +    const uint32_t fence_value=*static_cast<volatile uint32_t *>(fence);
 +    if(lo!=(uint32_t)ring_iova || hi || slo!=(uint32_t)shadow_iova || shi || control!=expected || sqe!=1 ||
 +       wptr>=ring_bytes/4 || shadow_value!=wptr || fence_value!=seed) {
-+        IOLog("SWEET NATIVE ADRENO: A618 adopt mismatch lo=%#x hi=%#x slo=%#x shi=%#x control=%#x expected=%#x sqe=%#x wptr=%#x shadow=%#x fence=%#x seed=%#x\\n",
++        IOLog("SWEET NATIVE ADRENO: A618 adopt mismatch lo=%#x hi=%#x slo=%#x shi=%#x control=%#x expected=%#x sqe=%#x wptr=%#x shadow=%#x fence=%#x seed=%#x\n",
 +            lo,hi,slo,shi,control,expected,sqe,wptr,shadow_value,fence_value,seed);
 +        return kIOReturnNotReady;
 +    }

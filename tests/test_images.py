@@ -24,6 +24,16 @@ root_tweaks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(root_tweaks)
 
 
+def write_adreno_firmware(directory):
+    for name, size in (
+        ("a618_gmu.bin", 16),
+        ("a630_sqe.fw", 16),
+        ("a615_zap.mdt", 0x1ACC),
+        ("a615_zap.b02", 0x7C0),
+    ):
+        (directory / name).write_bytes(bytes(size))
+
+
 class Images(unittest.TestCase):
     def test_v2_sections_and_aosp_image_id(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -105,7 +115,10 @@ class Images(unittest.TestCase):
                 mkadt.build(product=path)
             firmware = Path(scratch) / "touch.bin"
             firmware.write_bytes(b"device-supplied touch firmware")
-            root = mkadt.build(product=path, touch_firmware=firmware)
+            write_adreno_firmware(path.parent)
+            root = mkadt.build(
+                product=path, touch_firmware=firmware, adreno_firmware_dir=path.parent
+            )
         generated = next(node for node in root.children if node.name == "product")
         self.assertEqual(generated.prop("product-name"), b"Test Product\0")
         self.assertIsNone(generated.prop("placeholder"))
@@ -113,6 +126,10 @@ class Images(unittest.TestCase):
         self.assertEqual(
             chosen.prop("focaltech-firmware"), b"device-supplied touch firmware"
         )
+        adreno = next(node for node in root.children if node.name == "sweet-adreno")
+        self.assertEqual(adreno.prop("gmu-firmware"), bytes(16))
+        self.assertEqual(adreno.prop("zap-reserved-base"), mkadt.u64(0x93B15000))
+        self.assertEqual(adreno.prop("zap-reserved-size"), mkadt.u32(0x2000))
         self.assertIsNone(chosen.prop("sweet-qemu"))
         for name in ("bluetooth0", "ethernet0", "wifi0"):
             self.assertIsNone(chosen.prop("mac-address-" + name))
@@ -135,9 +152,11 @@ class Images(unittest.TestCase):
             bluetooth.write_bytes(bytes((2, 0, 0, 0, 0, 2)))
             firmware = Path(scratch) / "touch.bin"
             firmware.write_bytes(b"test firmware")
+            write_adreno_firmware(product.parent)
             root = mkadt.build(
                 product=product,
                 touch_firmware=firmware,
+                adreno_firmware_dir=product.parent,
                 wifi_mac=wifi,
                 bluetooth_mac=bluetooth,
             )
@@ -151,7 +170,12 @@ class Images(unittest.TestCase):
                 mkadt.build(qemu=True, wifi_mac=wifi)
             wifi.write_bytes(b"not six bytes")
             with self.assertRaisesRegex(ValueError, "six raw bytes"):
-                mkadt.build(product=product, touch_firmware=firmware, wifi_mac=wifi)
+                mkadt.build(
+                    product=product,
+                    touch_firmware=firmware,
+                    adreno_firmware_dir=product.parent,
+                    wifi_mac=wifi,
+                )
 
     def test_root_preparation_invalidates_cached_hardware_answers(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -241,6 +265,8 @@ class Images(unittest.TestCase):
         good = subprocess.check_output(["bash", script, "good"], text=True).strip()
         wifi = subprocess.check_output(["bash", script, "wifi"], text=True).strip()
         self.assertEqual(wifi, good + " modem=1 wifi=1")
+        gpu = subprocess.check_output(["bash", script, "gpu"], text=True).strip()
+        self.assertEqual(gpu, good + " sweetgpu=9")
         replaced = subprocess.check_output(
             ["bash", script, "good", "cpus=1"], text=True
         ).split()
