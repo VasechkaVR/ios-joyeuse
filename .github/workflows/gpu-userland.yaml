@@ -2,6 +2,9 @@ name: Joyeuse GPU Userland
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'gpu-userland/**'
 
 permissions:
   contents: read

@@ -63,7 +63,12 @@ def launchd(root):
     plist = load(path)
     jobs = plist["LaunchDaemons"]
     renamed = 0
+    voicemail_disabled = 0
     for job in jobs.values():
+        if job.get("Label") == "com.apple.voicemail.vmd":
+            job["Disabled"] = True
+            job["RunAtLoad"] = False
+            voicemail_disabled += 1
         if "_PanicOnCrash" in job:
             job["_PanicOnCrasX"] = job.pop("_PanicOnCrash")
             renamed += 1
@@ -72,7 +77,8 @@ def launchd(root):
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(
-        f"launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed"
+        f"launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed, "
+        f"{voicemail_disabled} voicemail vmd jobs disabled"
     )
 
 
@@ -268,21 +274,28 @@ def posterboard_and_tcc(root):
         st = os.stat(ld_path)
         plist = load(ld_path)
         jobs = plist["LaunchDaemons"]
-        # Disable every merged registration for this label, including the
-        # LaunchAngel entry: launchd uses the merged dictionary at bootstrap.
+        # PosterBoard is currently killed for exceeding its per-process Jetsam
+        # limit and immediately re-spawns in a crash loop. Until its footprint
+        # is understood, disable both LaunchAngel and merged daemon entries.
+        # Do not guess a larger memory limit from the exit reason alone.
+        changed = 0
         for existing in jobs.values():
             if existing.get("Label") == "com.apple.PosterBoard":
                 existing["RunAtLoad"] = False
                 existing["Disabled"] = True
-        key = "/System/Library/LaunchDaemons/com.apple.PosterBoard.plist"
+                existing["KeepAlive"] = False
+                changed += 1
         job = load(angel_path)
         job["RunAtLoad"] = False
         job["Disabled"] = True
+        job["KeepAlive"] = False
         save(angel_path, job, os.stat(angel_path).st_uid, os.stat(angel_path).st_gid, os.stat(angel_path).st_mode & 0o7777)
+        # Keep the registration disabled in the merged launchd database too.
+        key = "/System/Library/LaunchDaemons/com.apple.PosterBoard.plist"
         job["MachServices"] = {"com.apple.posterboardservices.services": True}
         jobs[key] = job
         save(ld_path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-        print("launchd.plist: kept com.apple.PosterBoard disabled (early LaunchServices registration can hang SpringBoard)")
+        print(f"launchd.plist: disabled PosterBoard LaunchAngel and {changed} merged job(s) to stop Jetsam restart loop")
 
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(
