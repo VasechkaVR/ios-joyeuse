@@ -17,7 +17,7 @@ shift
 if [ "$base" = good ]; then
 	# Normal-performance profile: retain useful crash diagnostics without the
 	# high-volume process sampler or kernel printf flood. The panel runs at 60 Hz.
-	base_line='debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress ufsroot=iosroot rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweetpresentwait=1 sweettouchdelay=5 panichalt=1 ufslogsecs=5 sweetfb_noconsole=1'
+	base_line='debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress ufsroot=iosroot rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweetpresentwait=1 sweettouchdelay=5 panichalt=1 ufslogsecs=5 sweetfb_noconsole=1 sweetusb=2'
 elif [ "$base" = fast ]; then
 	# Experimental frame-pacing profile: keep the proven good baseline intact,
 	# but remove the CPU presentation fence gate and request 60 Hz scheduling.
