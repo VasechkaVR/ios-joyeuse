@@ -1,0 +1,16 @@
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -1444,4 +1444,12 @@
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
+  if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
++ // LA08 stores luminance in R and alpha in G. Sampling RG8Unorm (Metal format
++ // 30) with identity swizzle exposes luminance only as red, tinting white glyphs
++ // red. Replicate R into RGB and preserve G as alpha for CoreAnimation.
++ if(IOSurfaceGetPixelFormat(surface)==(((OSType)'L'<<24)|((OSType)'A'<<16)|((OSType)'0'<<8)|(OSType)'8') &&
++    IOSurfaceGetBytesPerElement(surface)==2 && d.pixelFormat==MTLPixelFormatRG8Unorm) {
++  d.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleRed,
++    MTLTextureSwizzleRed,MTLTextureSwizzleGreen);
++ }
+  noteSurfaceTexture(d,surface);
+  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
