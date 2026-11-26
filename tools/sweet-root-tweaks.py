@@ -76,6 +76,34 @@ def launchd(root):
     )
 
 
+def user_temporary_directories(root):
+    # libsystem_coreservices falls back to /var/tmp when TMPDIR is unset.
+    # libsystem_c's confstr fallback requires the selected temp directory to
+    # pass access(W_OK); /var/tmp must therefore be the standard sticky,
+    # world-writable directory so mobile (uid 501) and system daemons can use it.
+    tmp = os.path.join(root, "private/var/tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp, exist_ok=True)
+        print("mkdir", tmp)
+    st = os.stat(tmp)
+    if (st.st_uid, st.st_gid, st.st_mode & 0o7777) != (0, 0, 0o1777):
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, 0o1777)
+        print("chmod 1777", tmp)
+
+    # Keep the system-owned randomized-directory namespace available for
+    # per-user DARWIN_USER_* directories created by the OS at runtime.
+    base = os.path.join(root, "private/var/folders")
+    zz = os.path.join(base, "zz")
+    if not os.path.isdir(zz):
+        os.makedirs(zz, exist_ok=True)
+    st = os.stat(zz)
+    if (st.st_uid, st.st_gid, st.st_mode & 0o7777) != (0, 0, 0o755):
+        os.chown(zz, 0, 0)
+        os.chmod(zz, 0o755)
+        print("chmod 755", zz)
+
+
 def containers(root):
     base = os.path.join(root, "private/var/containers")
     for sub, uid in (
@@ -270,6 +298,7 @@ def main():
     launchd(root)
     managed_configuration(root)
     posterboard_and_tcc(root)
+    user_temporary_directories(root)
     containers(root)
     activation(root, build, version)
     audio(root)
