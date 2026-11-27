@@ -347,7 +347,7 @@ index 0000000..d8e7c78
 + * configured iOS 16 wallpaper) aborts without one; sweetm2extra=0 disables. */
 +bool extra_client(const char *name)
 +{
-+ static const char *const names[]={"AegirPoster"};
++ static const char *const names[]={"AegirPoster","SpringBoard","Sileo"};
 + for(const char *n:names)if(!strcmp(name,n))return true;
 + return false;
 +}

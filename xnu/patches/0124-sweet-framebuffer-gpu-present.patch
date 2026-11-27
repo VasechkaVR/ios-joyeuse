@@ -748,7 +748,7 @@ index 6e4179e..511ce17 100644
 +	IOLockLock(bl->fLock);
 +	const uint32_t level = bl->fWanted;
 +	IOLockUnlock(bl->fLock);
-+	if (level == 0 || level == bl->fSent || bl->fFailures >= 4) {
++	if (level == bl->fSent || bl->fFailures >= 4) {
 +		return;
 +	}
 +	const int error = bl->sendLevel(level);
