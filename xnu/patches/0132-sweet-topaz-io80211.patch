@@ -1,0 +1,311 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -32,5 +32,7 @@
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <sys/ioccom.h>
+ #include <sys/socket.h>
+ #include <sys/sockio.h>
+ #include <sys/mbuf.h>
+@@ -5080,6 +5082,7 @@
+ static char wl_ssid[33];
+ static char wl_pass[64];
+ static volatile bool wl_up;
++static char wl_current_ssid[33];
+ 
+ static errno_t
+ wl_output(ifnet_t ifp, mbuf_t m)
+@@ -5088,2 +5091,262 @@
+ 	return topaz_wlan_transmit(buf, len) ? 0 : ENETDOWN;
+ }
++
++/*
++ * EXPERIMENTAL apple80211 ioctl compatibility layer.  These request numbers and
++ * the compact structures below follow the public PureDarwin/VirtualMac80211
++ * headers; they have NOT been verified against the private iOS 16.7.16 ABI.
++ * In particular req_len, scan-result layout, capability encoding and the
++ * association key's passphrase interpretation may differ on iOS.
++ */
++#define TOPAZ_APPLE80211_IFNAMSIZ 16
++#define TOPAZ_APPLE80211_MAX_SSID_LEN 32
++#define TOPAZ_APPLE80211_KEY_LEN 64
++#define TOPAZ_APPLE80211_MAX_RATES 15
++#define TOPAZ_IOC_SSID 1
++#define TOPAZ_IOC_RATE 8
++#define TOPAZ_IOC_BSSID 9
++#define TOPAZ_IOC_SCAN_REQ 10
++#define TOPAZ_IOC_SCAN_RESULT 11
++#define TOPAZ_IOC_CARD_CAPABILITIES 12
++#define TOPAZ_IOC_SUPPORTED_CHANNELS 18
++#define TOPAZ_IOC_STATE 13
++#define TOPAZ_IOC_RSSI 16
++#define TOPAZ_IOC_POWER 19
++#define TOPAZ_IOC_ASSOCIATE 20
++#define TOPAZ_IOC_DISASSOCIATE 22
++#define TOPAZ_IOC_COUNTRY_CODE 51
++#define TOPAZ_STATE_INIT 0
++#define TOPAZ_STATE_SCAN 1
++#define TOPAZ_STATE_RUN 4
++#define TOPAZ_AUTH_OPEN 0x0000
++#define TOPAZ_AUTH_WPA2_PSK 0x0010
++
++struct topaz_apple80211req {
++	char req_if_name[TOPAZ_APPLE80211_IFNAMSIZ];
++	int req_type;
++	int req_val;
++	uint32_t req_len;
++	void *req_data;
++};
++#define TOPAZ_SIOCSA80211 _IOW('i', 200, struct topaz_apple80211req)
++#define TOPAZ_SIOCGA80211 _IOWR('i', 201, struct topaz_apple80211req)
++struct topaz_apple80211_ssid { uint32_t version, ssid_len; uint8_t ssid[32]; };
++struct topaz_apple80211_bssid { uint32_t version; uint8_t bssid[6]; };
++struct topaz_apple80211_state { uint32_t version, state; };
++struct topaz_apple80211_rssi { uint32_t version; int32_t rssi, noise; };
++struct topaz_apple80211_power { uint32_t version, power_state; };
++struct topaz_apple80211_caps { uint32_t version, phy_modes, auth_types; };
++struct topaz_apple80211_scan {
++	uint32_t version, ssid_len;
++	uint8_t ssid[32];
++};
++struct topaz_apple80211_scan_result {
++	uint32_t version;
++	struct { uint32_t version, channel, flags; } channel;
++	int16_t noise, rssi;
++	uint16_t beacon_int, capability;
++	uint8_t bssid[6], nrates;
++	uint32_t rates[TOPAZ_APPLE80211_MAX_RATES];
++	uint8_t ssid_len, ssid[32];
++	uint32_t auth_types, age;
++};
++struct topaz_apple80211_assoc {
++	uint32_t version, auth_type, ssid_len;
++	uint8_t ssid[32], bssid[6];
++	uint32_t key_len;
++	uint8_t key[TOPAZ_APPLE80211_KEY_LEN];
++};
++
++static volatile bool wl_radio_enabled = true;
++
++static int
++wl_apple80211_ioctl(void *data, bool set)
++{
++	struct topaz_apple80211req *req = (struct topaz_apple80211req *)data;
++	uint8_t buffer[sizeof(struct topaz_apple80211_scan_result)];
++	uint32_t length;
++	int error = 0;
++
++	if (req == NULL || req->req_data == NULL || req->req_len > sizeof(buffer)) {
++		return EINVAL;
++	}
++	if (set) {
++		if (req->req_len > sizeof(buffer) || copyin((user_addr_t)req->req_data, buffer, req->req_len) != 0) {
++			return EFAULT;
++		}
++		switch (req->req_type) {
++		case TOPAZ_IOC_POWER: {
++			struct topaz_apple80211_power *p = (void *)buffer;
++			if (req->req_len < sizeof(*p)) return EINVAL;
++			wl_radio_enabled = p->power_state != 0;
++			if (!wl_radio_enabled) (void)topaz_wlan_leave();
++			return 0;
++		}
++		case TOPAZ_IOC_SCAN_REQ:
++			if (!wl_radio_enabled) return ENETDOWN;
++			return topaz_wlan_scan();
++		case TOPAZ_IOC_ASSOCIATE: {
++			struct topaz_apple80211_assoc *a = (void *)buffer;
++			if (!wl_radio_enabled) return ENETDOWN;
++			if (req->req_len < sizeof(*a) || a->ssid_len == 0 || a->ssid_len > 32 || a->key_len > sizeof(a->key)) return EINVAL;
++			if (a->auth_type != TOPAZ_AUTH_OPEN && a->auth_type != TOPAZ_AUTH_WPA2_PSK) return EOPNOTSUPP;
++			if (a->key_len != 0 && (a->key_len < 8 || a->key_len > 63)) return EINVAL;
++			error = topaz_wlan_join(a->ssid, a->ssid_len, a->bssid,
++			    a->key_len != 0 ? a->key : NULL, a->key_len);
++			if (error == 0) {
++				memcpy(wl_current_ssid, a->ssid, a->ssid_len);
++				wl_current_ssid[a->ssid_len] = 0;
++			}
++			return error;
++		}
++		case TOPAZ_IOC_DISASSOCIATE:
++			bzero(wl_current_ssid, sizeof(wl_current_ssid));
++			return topaz_wlan_leave();
++		default:
++			return EOPNOTSUPP;
++		}
++	}
++
++	length = req->req_len;
++	bzero(buffer, sizeof(buffer));
++	switch (req->req_type) {
++	case TOPAZ_IOC_POWER: {
++		struct topaz_apple80211_power *p = (void *)buffer;
++		if (length < sizeof(*p)) return EINVAL;
++		p->version = 1; p->power_state = wl_radio_enabled;
++		length = sizeof(*p); break;
++	}
++	case TOPAZ_IOC_CARD_CAPABILITIES: {
++		struct topaz_apple80211_caps *c = (void *)buffer;
++		if (length < sizeof(*c)) return EINVAL;
++		c->version = 1; c->phy_modes = 0x009e; c->auth_types = TOPAZ_AUTH_OPEN | TOPAZ_AUTH_WPA2_PSK;
++		length = sizeof(*c); break;
++	}
++	case TOPAZ_IOC_COUNTRY_CODE:
++		if (length < 8) return EINVAL;
++		((uint32_t *)buffer)[0] = 1;
++		memcpy(buffer + 4, "US", 2);
++		length = 8; break;
++	case TOPAZ_IOC_SUPPORTED_CHANNELS:
++		/* Prototype-only compact channel list; the iOS 16 structure is unknown. */
++		if (length < 4 + 36 * sizeof(uint32_t)) return EINVAL;
++		((uint32_t *)buffer)[0] = 36;
++		for (unsigned i = 0; i < 36; i++) ((uint32_t *)buffer)[i + 1] = i < 13 ? i + 1 : 36 + (i - 13);
++		length = 4 + 36 * sizeof(uint32_t); break;
++	case TOPAZ_IOC_SCAN_RESULT: {
++		struct topaz_wlan_bss b;
++		struct topaz_apple80211_scan_result *r = (void *)buffer;
++		if (length < sizeof(*r)) return EINVAL;
++		if (!topaz_wlan_heard((unsigned)req->req_val, &b)) return ENOENT;
++		r->version = 1; r->channel.version = 1;
++		r->channel.channel = b.frequency <= 2484 ? (b.frequency == 2484 ? 14 : (b.frequency - 2407) / 5) : (b.frequency - 5000) / 5;
++		r->channel.flags = b.frequency <= 2484 ? 2 : 4;
++		r->rssi = b.rssi; r->noise = -95; r->beacon_int = b.beacon_interval; r->capability = b.capability;
++		memcpy(r->bssid, b.bssid, 6); r->ssid_len = b.ssid_length; memcpy(r->ssid, b.ssid, b.ssid_length);
++		r->auth_types = TOPAZ_AUTH_OPEN;
++		for (uint32_t i = 0; i + 1 < b.elements_length;) {
++			uint8_t id = b.elements[i], n = b.elements[i + 1];
++			if (i + 2 + n > b.elements_length) break;
++			if (id == 48 || (id == 221 && n >= 4 && b.elements[i + 2] == 0x00 && b.elements[i + 3] == 0x50 && b.elements[i + 4] == 0xf2)) r->auth_types |= TOPAZ_AUTH_WPA2_PSK;
++			i += 2 + n;
++		}
++		r->age = b.age_ms; length = sizeof(*r); break;
++	}
++	case TOPAZ_IOC_SSID: {
++		struct topaz_apple80211_ssid *s = (void *)buffer;
++		if (length < sizeof(*s)) return EINVAL;
++		s->version = 1; s->ssid_len = (uint32_t)strnlen(wl_current_ssid, 32); memcpy(s->ssid, wl_current_ssid, s->ssid_len); length = sizeof(*s); break;
++	}
++	case TOPAZ_IOC_BSSID: {
++		struct topaz_apple80211_bssid *d = (void *)buffer;
++		struct topaz_wlan_bss b;
++		if (length < sizeof(*d)) return EINVAL;
++		d->version = 1;
++		for (unsigned i = 0; topaz_wlan_heard(i, &b); i++) if (memcmp(b.ssid, wl_current_ssid, b.ssid_length) == 0 && b.ssid_length == strlen(wl_current_ssid)) { memcpy(d->bssid, b.bssid, 6); break; }
++		length = sizeof(*d); break;
++	}
++	case TOPAZ_IOC_STATE: {
++		struct topaz_apple80211_state *s = (void *)buffer;
++		if (length < sizeof(*s)) return EINVAL;
++		s->version = 1; s->state = topaz_wlan_joined() ? TOPAZ_STATE_RUN : TOPAZ_STATE_INIT; length = sizeof(*s); break;
++	}
++	case TOPAZ_IOC_RSSI: {
++		struct topaz_apple80211_rssi *r = (void *)buffer;
++		struct topaz_wlan_bss b;
++		if (length < sizeof(*r)) return EINVAL;
++		r->version = 1; r->rssi = -127; r->noise = -95;
++		for (unsigned i = 0; topaz_wlan_heard(i, &b); i++) if (b.ssid_length == strlen(wl_current_ssid) && memcmp(b.ssid, wl_current_ssid, b.ssid_length) == 0) { r->rssi = b.rssi; break; }
++		length = sizeof(*r); break;
++	}
++	case TOPAZ_IOC_RATE:
++		if (length < 12) return EINVAL;
++		((uint32_t *)buffer)[0] = 1; ((uint32_t *)buffer)[1] = 1; ((uint32_t *)buffer)[2] = topaz_wlan_joined() ? 1 : 0; length = 12; break;
++	case TOPAZ_IOC_SCAN_REQ:
++		((uint32_t *)buffer)[0] = 1; length = 4; break;
++	default:
++		return EOPNOTSUPP;
++	}
++	if (copyout(buffer, (user_addr_t)req->req_data, length) != 0) return EFAULT;
++	req->req_len = length;
++	return 0;
++}
++
++static void
++wl_decode_percent20(char *s)
++{
++	char *d = s;
++	while (*s != '\0') {
++		if (s[0] == '%' && s[1] == '2' && s[2] == '0') { *d++ = ' '; s += 3; }
++		else { *d++ = *s++; }
++	}
++	*d = '\0';
++}
++
++static int
++wl_sysctl_scan SYSCTL_HANDLER_ARGS
++{
++	int value = 0, error;
++	if (req->newptr != USER_ADDR_NULL) {
++		error = SYSCTL_IN(req, &value, sizeof(value));
++		if (error) return error;
++		if (value) return topaz_wlan_scan();
++	}
++	value = topaz_wlan_ready() ? 1 : 0;
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++
++static int
++wl_sysctl_list SYSCTL_HANDLER_ARGS
++{
++	struct topaz_wlan_bss b;
++	char line[160];
++	for (unsigned i = 0; topaz_wlan_heard(i, &b); i++) {
++		int n = snprintf(line, sizeof(line), "%u\t%.*s\t%02x:%02x:%02x:%02x:%02x:%02x\t%d dBm\t%u MHz\n",
++		    i, b.ssid_length, b.ssid, b.bssid[0], b.bssid[1], b.bssid[2], b.bssid[3], b.bssid[4], b.bssid[5], b.rssi, b.frequency);
++		int error = SYSCTL_OUT(req, line, (size_t)n);
++		if (error) return error;
++	}
++	return 0;
++}
++
++/* Write "SSID\tPASS" to join without rebooting; empty PASS selects an open network. */
++static int
++wl_sysctl_join SYSCTL_HANDLER_ARGS
++{
++	char input[128];
++	struct topaz_wlan_bss b;
++	if (req->newptr == USER_ADDR_NULL) return SYSCTL_OUT(req, "write SSID<TAB>PASS to join", 25);
++	bzero(input, sizeof(input));
++	int error = SYSCTL_IN(req, input, sizeof(input) - 1);
++	if (error) return error;
++	char *sep = strchr(input, '\t');
++	if (sep == NULL) return EINVAL;
++	*sep++ = '\0';
++	size_t sl = strlen(input), pl = strlen(sep);
++	if (sl == 0 || sl > 32 || pl > 63) return EINVAL;
++	const uint8_t *bssid = NULL;
++	for (unsigned i = 0; topaz_wlan_heard(i, &b); i++) if (b.ssid_length == sl && memcmp(b.ssid, input, sl) == 0) { bssid = b.bssid; break; }
++	error = topaz_wlan_join((const uint8_t *)input, (unsigned)sl, bssid, pl ? (const uint8_t *)sep : NULL, (unsigned)pl);
++	if (!error) { strlcpy(wl_current_ssid, input, sizeof(wl_current_ssid)); }
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wifi_scan, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY,
++	0, 0, wl_sysctl_scan, "I", "write 1 to request a scan; read radio-ready status");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wifi_list, CTLTYPE_STRING | CTLFLAG_RD,
++	0, 0, wl_sysctl_list, "A", "Topaz scan results: index, SSID, BSSID, RSSI, frequency");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wifi_join, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY,
++	0, 0, wl_sysctl_join, "A", "write SSID<TAB>PASS to join (empty PASS means open)");
+@@ -5130,5 +5508,9 @@
+ wl_ioctl(ifnet_t ifp, u_long cmd, void *data)
+ {
+ 	switch (cmd) {
++	case TOPAZ_SIOCGA80211:
++		return wl_apple80211_ioctl(data, false);
++	case TOPAZ_SIOCSA80211:
++		return wl_apple80211_ioctl(data, true);
+ 	case SIOCSIFADDR:
+ 	case SIOCAIFADDR:
+@@ -5290,3 +5672,4 @@
+ 			LOG("wifi: link lost");
++			bzero(wl_current_ssid, sizeof(wl_current_ssid));
+ 			IOSleep(3000);
+ 		} else {
+@@ -5830,4 +6214,6 @@
+ 	if (wifi_enabled() && PE_parse_boot_argn("wifi_ssid", wl_ssid, sizeof(wl_ssid)) &&
+ 	    wl_ssid[0] != '\0') {
++		wl_decode_percent20(wl_ssid);
+ 		(void)PE_parse_boot_argn("wifi_pass", wl_pass, sizeof(wl_pass));
++		wl_decode_percent20(wl_pass);
+ 		topaz_wlan_rx_hook = wl_rx;
