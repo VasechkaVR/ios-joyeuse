@@ -1,7 +1,7 @@
-diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -32,5 +32,7 @@
+@@ -23,6 +23,8 @@
+ #include <libkern/crc.h>
  #include <sys/param.h>
  #include <sys/errno.h>
 +#include <sys/sysctl.h>
@@ -9,7 +9,7 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  #include <sys/socket.h>
  #include <sys/sockio.h>
  #include <sys/mbuf.h>
-@@ -5080,6 +5082,7 @@
+@@ -5101,6 +5103,7 @@
  static char wl_ssid[33];
  static char wl_pass[64];
  static volatile bool wl_up;
@@ -17,17 +17,10 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
  
  static errno_t
  wl_output(ifnet_t ifp, mbuf_t m)
-@@ -5088,2 +5091,262 @@
+@@ -5118,10 +5121,274 @@
  	return topaz_wlan_transmit(buf, len) ? 0 : ENETDOWN;
  }
-+
-+/*
-+ * EXPERIMENTAL apple80211 ioctl compatibility layer.  These request numbers and
-+ * the compact structures below follow the public PureDarwin/VirtualMac80211
-+ * headers; they have NOT been verified against the private iOS 16.7.16 ABI.
-+ * In particular req_len, scan-result layout, capability encoding and the
-+ * association key's passphrase interpretation may differ on iOS.
-+ */
+ 
 +#define TOPAZ_APPLE80211_IFNAMSIZ 16
 +#define TOPAZ_APPLE80211_MAX_SSID_LEN 32
 +#define TOPAZ_APPLE80211_KEY_LEN 64
@@ -287,7 +280,8 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	0, 0, wl_sysctl_list, "A", "Topaz scan results: index, SSID, BSSID, RSSI, frequency");
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_wifi_join, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY,
 +	0, 0, wl_sysctl_join, "A", "write SSID<TAB>PASS to join (empty PASS means open)");
-@@ -5130,5 +5508,9 @@
++
+ static errno_t
  wl_ioctl(ifnet_t ifp, u_long cmd, void *data)
  {
  	switch (cmd) {
@@ -296,16 +290,32 @@ diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
 +	case TOPAZ_SIOCSA80211:
 +		return wl_apple80211_ioctl(data, true);
  	case SIOCSIFADDR:
- 	case SIOCAIFADDR:
-@@ -5290,3 +5672,4 @@
+ 	case SIOCAIFADDR:                    /* feth: configd's way of bringing it up */
+ 		(void)ifnet_set_flags(ifp, IFF_UP, IFF_UP);
+@@ -5327,6 +5594,7 @@
+ 				IOSleep(1000);
+ 			}
  			LOG("wifi: link lost");
 +			bzero(wl_current_ssid, sizeof(wl_current_ssid));
  			IOSleep(3000);
  		} else {
-@@ -5830,4 +6214,6 @@
+ 			LOG("wifi: join failed %d", r);
+@@ -5836,7 +6104,7 @@
+ 	thread_terminate(current_thread());
+ }
+ 
+-extern "C" void
++void
+ topaz_modem_init(void)
+ {
+ 	static bool started;
+@@ -5849,7 +6117,9 @@
+ 	started = true;
  	if (wifi_enabled() && PE_parse_boot_argn("wifi_ssid", wl_ssid, sizeof(wl_ssid)) &&
  	    wl_ssid[0] != '\0') {
 +		wl_decode_percent20(wl_ssid);
  		(void)PE_parse_boot_argn("wifi_pass", wl_pass, sizeof(wl_pass));
 +		wl_decode_percent20(wl_pass);
  		topaz_wlan_rx_hook = wl_rx;
+ 		topaz_wlan_link_hook = wl_link;
+ 		thread_t wlth;
